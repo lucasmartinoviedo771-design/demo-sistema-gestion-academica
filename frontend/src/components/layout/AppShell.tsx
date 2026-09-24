@@ -1,0 +1,246 @@
+import Box from "@mui/material/Box";
+import CssBaseline from "@mui/material/CssBaseline";
+import Stack from "@mui/material/Stack";
+import Toolbar from "@mui/material/Toolbar";
+import { useQuery } from "@tanstack/react-query";
+import {
+	type PropsWithChildren,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
+import { ErrorBoundary } from "react-error-boundary";
+import { useLocation, useNavigate } from "react-router-dom";
+import { obtenerResumenMensajes } from "@/api/mensajes";
+import ErrorBoundaryFallback from "@/components/ErrorBoundaryFallback";
+import ActaOralConformidadModal from "@/components/estudiantes/ActaOralConformidadModal";
+import MesasPendientesModal from "@/components/estudiantes/MesasPendientesModal";
+import BackButton from "@/components/ui/BackButton";
+import { useAuth } from "@/context/AuthContext";
+import { getDefaultHomeRoute, isOnlyEstudiante } from "@/utils/roles";
+import { AppSidebar } from "./app-shell/AppSidebar";
+import { AppTopBar } from "./app-shell/AppTopBar";
+import { ImpersonationBanner } from "./app-shell/ImpersonationBanner";
+import { roleHomeMap } from "./app-shell/constants";
+import { UserGuideDialog } from "./app-shell/UserGuideDialog";
+import { useNavPermissions } from "./app-shell/useNavPermissions";
+
+export default function AppShell({ children }: PropsWithChildren) {
+	const {
+		user,
+		logout,
+		roleOverride,
+		setRoleOverride,
+		availableRoleOptions,
+		activeRole,
+		setActiveRole,
+	} = useAuth();
+	const [open, setOpen] = useState<boolean>(() => {
+		try {
+			const v = localStorage.getItem("sidebarOpen");
+			return v === null ? true : v === "1";
+		} catch {
+			return true;
+		}
+	});
+	const [guideOpen, setGuideOpen] = useState(false);
+	const loc = useLocation();
+	const navigate = useNavigate();
+
+	const current = useMemo(() => loc.pathname, [loc.pathname]);
+	const [hasPageBack, setHasPageBack] = useState(false);
+	const mainRef = useRef<HTMLElement>(null);
+
+	useLayoutEffect(() => {
+		if (typeof document === "undefined") return;
+		const detect = () => {
+			const pageBack = mainRef.current?.querySelector(
+				"[data-back-button='page']",
+			);
+			setHasPageBack(!!pageBack);
+		};
+		detect();
+		const observer = new MutationObserver(() => detect());
+		if (mainRef.current) {
+			observer.observe(mainRef.current, { childList: true, subtree: true });
+		}
+		return () => observer.disconnect();
+	}, [current]);
+
+	const studentOnly = isOnlyEstudiante(user);
+
+	const navPerms = useNavPermissions(user, roleOverride, activeRole);
+	const { canUseMessages } = navPerms;
+
+	const previousRoleRef = useRef<string | null>(roleOverride || activeRole);
+	const isInitialMount = useRef<boolean>(true);
+
+	useEffect(() => {
+		if (!user) return;
+
+		const currentRole = roleOverride || activeRole;
+		if (currentRole) {
+			const baseRole = currentRole.split(":")[0].toLowerCase();
+			const destination =
+				roleHomeMap[baseRole] ?? roleHomeMap[currentRole] ?? "/dashboard";
+			const isAtGenericHome =
+				loc.pathname === "/dashboard" || loc.pathname === "/";
+			const isRoleMismatch = isAtGenericHome && destination !== "/dashboard";
+
+			if (previousRoleRef.current !== currentRole || isRoleMismatch) {
+				navigate(destination, { replace: true });
+			}
+		} else if (previousRoleRef.current !== currentRole) {
+			navigate(getDefaultHomeRoute(user), { replace: true });
+		}
+
+		previousRoleRef.current = currentRole;
+	}, [roleOverride, activeRole, user, navigate, loc.pathname]);
+
+	useEffect(() => {
+		if (!user || roleOverride || activeRole || isInitialMount.current === false)
+			return;
+
+		// Auto-selección inicial si no hay un rol activo en localStorage/session
+		if (availableRoleOptions.length > 0) {
+			const defaultRole = availableRoleOptions[0].value;
+			setRoleOverride(defaultRole);
+			setActiveRole(defaultRole);
+		}
+		isInitialMount.current = false;
+	}, [
+		user,
+		roleOverride,
+		activeRole,
+		availableRoleOptions,
+		setRoleOverride,
+		setActiveRole,
+	]);
+
+	const { data: messageSummary } = useQuery({
+		queryKey: ["mensajes", "resumen"],
+		queryFn: obtenerResumenMensajes,
+		enabled: canUseMessages,
+		refetchInterval: 60_000,
+		staleTime: 60_000,
+	});
+
+	const unreadMessages = messageSummary?.unread ?? 0;
+	const badgeColor =
+		unreadMessages === 0
+			? "default"
+			: messageSummary?.sla_danger
+				? "error"
+				: messageSummary?.sla_warning
+					? "warning"
+					: "primary";
+
+	useEffect(() => {
+		try {
+			localStorage.setItem("sidebarOpen", open ? "1" : "0");
+		} catch (_error) {
+			void 0;
+		}
+	}, [open]);
+
+	return (
+		<Box
+			sx={{ display: "flex", backgroundColor: "#f1f3f9", minHeight: "100vh" }}
+		>
+			<CssBaseline />
+
+			<AppTopBar
+				open={open}
+				user={user}
+				activeRole={activeRole}
+				canUseMessages={canUseMessages}
+				unreadMessages={unreadMessages}
+				badgeColor={badgeColor as "default" | "error" | "warning" | "primary"}
+				onToggleSidebar={() => setOpen((v) => !v)}
+				onGuideOpen={() => setGuideOpen(true)}
+				onLogout={logout}
+			/>
+
+			<UserGuideDialog open={guideOpen} onClose={() => setGuideOpen(false)} />
+			<ActaOralConformidadModal />
+			<MesasPendientesModal />
+
+			<AppSidebar
+				open={open}
+				current={current}
+				user={user}
+				canUseMessages={canUseMessages}
+				unreadMessages={unreadMessages}
+				badgeColor={badgeColor as "default" | "error" | "warning" | "primary"}
+				studentOnly={studentOnly}
+				dashboardVisible={navPerms.dashboardVisible}
+				canPreins={navPerms.canPreins}
+				canSeeCarreras={navPerms.canSeeCarreras}
+				canSeeAnalytics={navPerms.canSeeAnalytics}
+				canSecretaria={navPerms.canSecretaria}
+				canBedeles={navPerms.canBedeles}
+				canDocentesPanel={navPerms.canDocentesPanel}
+				canTutoriasPanel={navPerms.canTutoriasPanel}
+				canEquivalenciasPanel={navPerms.canEquivalenciasPanel}
+				canTitulosPanel={navPerms.canTitulosPanel}
+				canCoordinacionPanel={navPerms.canCoordinacionPanel}
+				canJefaturaPanel={navPerms.canJefaturaPanel}
+				canAsistenciaReportes={navPerms.canAsistenciaReportes}
+				canCursoIntro={navPerms.canCursoIntro}
+				canEstudiantePortal={navPerms.canEstudiantePortal}
+				canEstudiantePanel={navPerms.canEstudiantePanel}
+				canPrimeraCarga={navPerms.canPrimeraCarga}
+				canAttpPanel={navPerms.canAttpPanel}
+				canRectoradoPanel={navPerms.canRectoradoPanel}
+				onClose={() => setOpen(false)}
+				onOpen={() => setOpen(true)}
+			/>
+
+			<Box
+				component="main"
+				ref={mainRef}
+				className="app-main"
+				sx={{
+					flexGrow: 1,
+					minHeight: "100vh",
+					backgroundColor: "#f1f3f9",
+					transition: "margin 0.3s ease",
+					pt: 1,
+					px: { xs: 1, sm: 2, md: 4 },
+					pb: 1,
+				}}
+			>
+				<Toolbar sx={{ minHeight: 64 }} />
+				<ImpersonationBanner />
+				<ErrorBoundary
+					FallbackComponent={ErrorBoundaryFallback}
+					resetKeys={[current]}
+				>
+					<Box
+						sx={{
+							minHeight: "70vh",
+							borderRadius: 4,
+							backgroundColor: "#ffffff",
+							border: "1px solid #e2e8f0",
+							boxShadow: "0 25px 60px rgba(15,23,42,0.08)",
+							p: { xs: 1, sm: 2, md: 4 },
+						}}
+					>
+						<Stack key={current} spacing={{ xs: 2, md: 3 }}>
+							{!hasPageBack && (
+								<BackButton
+									scope="global"
+									fallbackPath={user ? getDefaultHomeRoute(user) : "/"}
+									sx={{ mb: 0 }}
+								/>
+							)}
+							{children}
+						</Stack>
+					</Box>
+				</ErrorBoundary>
+			</Box>
+		</Box>
+	);
+}

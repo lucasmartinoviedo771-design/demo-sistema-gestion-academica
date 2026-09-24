@@ -1,0 +1,736 @@
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+
+from django.conf import settings
+from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
+
+from core.models import Comision, Docente, Estudiante, InscripcionMateriaEstudiante, VentanaHabilitacion
+
+from .models import (
+    AsistenciaDocente,
+    AsistenciaEstudiante,
+    CalendarioAsistenciaEvento,
+    ClaseProgramada,
+    CursoEstudianteSnapshot,
+    CursoHorarioSnapshot,
+    DocenteMarcacionLog,
+    Justificacion,
+    JustificacionDetalle,
+)
+
+TOLERANCIA_ANTERIOR_MINUTOS = 10
+TOLERANCIA_TARDE_MINUTOS = 15
+
+
+@dataclass
+class ClaseGenerada:
+    clase: ClaseProgramada
+    creada: bool
+
+
+EVENT_NOTE_PREFIX = "[Evento] "
+
+
+def _eventos_para_fecha(fecha: date) -> list[CalendarioAsistenciaEvento]:
+    return list(
+        CalendarioAsistenciaEvento.objects.filter(
+            activo=True,
+            fecha_desde__lte=fecha,
+            fecha_hasta__gte=fecha,
+        ).select_related(
+            "turno",
+            "profesorado",
+            "plan",
+            "plan__profesorado",
+            "comision",
+            "comision__materia__plan_de_estudio__profesorado",
+            "docente",
+        )
+    )
+
+
+def _buscar_evento_que_aplica(
+    eventos: list[CalendarioAsistenciaEvento],
+    *,
+    fecha: date,
+    turno_id: int | None,
+    campo: str,
+    contexto: dict[str, int | None] | None = None,
+) -> CalendarioAsistenciaEvento | None:
+    for evento in eventos:
+        if not getattr(evento, campo, False):
+            continue
+        if not evento.cubre_fecha(fecha, turno_id):
+            continue
+        if contexto and not evento.aplica_a_contexto(contexto=contexto):
+            continue
+        return evento
+    return None
+
+
+def _contexto_para_horario(horario) -> dict[str, int | None]:
+    comision = horario.comision
+    plan_id = None
+    profesorado_id = None
+    if comision and comision.materia_id:
+        materia = getattr(comision, "materia", None)
+        if materia and materia.plan_de_estudio_id:
+            plan_id = materia.plan_de_estudio_id
+            profesorado_id = materia.plan_de_estudio.profesorado_id
+    return {
+        "comision_id": comision.id if comision else None,
+        "plan_id": plan_id,
+        "profesorado_id": profesorado_id,
+        "docente_id": comision.docente_id if comision else None,
+    }
+
+
+def _mensaje_evento(evento: CalendarioAsistenciaEvento) -> str:
+    partes = [evento.nombre]
+    if evento.turno_id:
+        partes.append(f"Turno {evento.turno.nombre}")
+    if evento.motivo:
+        partes.append(evento.motivo)
+    cuerpo = " - ".join(part for part in partes if part)
+    return f"{EVENT_NOTE_PREFIX}{cuerpo}" if cuerpo else EVENT_NOTE_PREFIX.strip()
+
+
+def _aplicar_evento_sobre_clase(
+    clase: ClaseProgramada,
+    *,
+    evento_docentes: CalendarioAsistenciaEvento | None,
+    evento_estudiantes: CalendarioAsistenciaEvento | None,
+) -> None:
+    nota_evento = (
+        _mensaje_evento(evento_docentes or evento_estudiantes) if (evento_docentes or evento_estudiantes) else ""
+    )
+    campos_actualizados: list[str] = []
+    if clase.estado != ClaseProgramada.Estado.CANCELADA:
+        clase.estado = ClaseProgramada.Estado.CANCELADA
+        campos_actualizados.append("estado")
+    if nota_evento and clase.notas != nota_evento:
+        clase.notas = nota_evento
+        campos_actualizados.append("notas")
+    if campos_actualizados:
+        clase.save(update_fields=[*campos_actualizados, "actualizado_en"])
+
+    if evento_docentes and clase.docente_id:
+        asistencia_docente, _ = AsistenciaDocente.objects.get_or_create(
+            clase=clase,
+            docente=clase.docente,
+            defaults={
+                "estado": AsistenciaDocente.Estado.JUSTIFICADA,
+                "registrado_via": AsistenciaDocente.RegistradoVia.SISTEMA,
+            },
+        )
+        asistencia_docente.estado = AsistenciaDocente.Estado.JUSTIFICADA
+        asistencia_docente.justificacion = None
+        asistencia_docente.alerta = False
+        asistencia_docente.alerta_tipo = ""
+        asistencia_docente.alerta_motivo = nota_evento
+        asistencia_docente.registrado_via = AsistenciaDocente.RegistradoVia.SISTEMA
+        asistencia_docente.registrado_por = None
+        asistencia_docente.registrado_en = timezone.now()
+        asistencia_docente.save(
+            update_fields=[
+                "estado",
+                "justificacion",
+                "alerta",
+                "alerta_tipo",
+                "alerta_motivo",
+                "registrado_via",
+                "registrado_por",
+                "registrado_en",
+            ]
+        )
+
+    if evento_estudiantes:
+        _ensure_asistencias_estudiantes(clase)
+        estudiantes_qs = AsistenciaEstudiante.objects.filter(clase=clase)
+        estudiantes_qs.update(
+            estado=AsistenciaEstudiante.Estado.AUSENTE_JUSTIFICADA,
+            justificacion=None,
+            registrado_via=AsistenciaEstudiante.RegistradoVia.SISTEMA,
+            registrado_por=None,
+            registrado_en=timezone.now(),
+        )
+
+
+def _docente_nombre_snapshot(docente: Docente | None) -> str:
+    if not docente:
+        return ""
+    partes = [docente.apellido or "", docente.nombre or ""]
+    nombre = " ".join(part.strip() for part in partes if part).strip()
+    return nombre or docente.dni or ""
+
+
+def _resolver_estudiante(snapshot: CursoEstudianteSnapshot) -> Estudiante | None:
+    if snapshot.estudiante_id:
+        return snapshot.estudiante
+    return Estudiante.objects.filter(persona__dni=snapshot.dni).first()
+
+
+def _obtener_clases_del_turno(clase: ClaseProgramada):
+    turno = clase.comision.turno if clase.comision_id else None
+    queryset = ClaseProgramada.objects.filter(
+        docente=clase.docente,
+        fecha=clase.fecha,
+        comision__in=Comision.objects.filter(docente=clase.docente, turno=turno),
+    )
+    return queryset
+
+
+def calcular_ventanas_turno(clase: ClaseProgramada):
+    """
+    Devuelve una tupla (ventana_inicio, umbral_tarde, ventana_fin, turno_nombre).
+    Las fechas devueltas son aware usando la zona horaria actual.
+    """
+    if not clase.docente:
+        return None
+    clases_turno = list(_obtener_clases_del_turno(clase).exclude(hora_inicio__isnull=True).order_by("hora_inicio"))
+    if not clases_turno:
+        return None
+
+    primera = min(
+        (c.hora_inicio for c in clases_turno if c.hora_inicio),
+        default=None,
+    )
+    ultima = max(
+        (c.hora_fin for c in clases_turno if c.hora_fin),
+        default=None,
+    )
+
+    if not primera:
+        return None
+
+    # Fallback de fin si no hay hora_fin: asumimos 3 horas desde el inicio.
+    if not ultima:
+        ultima_dt = datetime.combine(clase.fecha, primera) + timedelta(hours=3)
+        ultima = ultima_dt.time()
+
+    base_date = clase.fecha
+    base_inicio = datetime.combine(base_date, primera)
+    base_fin = datetime.combine(base_date, ultima)
+
+    if settings.USE_TZ:
+        tz = timezone.get_current_timezone()
+        ventana_inicio = timezone.make_aware(
+            base_inicio - timedelta(minutes=TOLERANCIA_ANTERIOR_MINUTOS),
+            tz,
+        )
+        umbral_tarde = timezone.make_aware(
+            base_inicio + timedelta(minutes=TOLERANCIA_TARDE_MINUTOS),
+            tz,
+        )
+        ventana_fin = timezone.make_aware(base_fin, tz)
+    else:
+        ventana_inicio = base_inicio - timedelta(minutes=TOLERANCIA_ANTERIOR_MINUTOS)
+        umbral_tarde = base_inicio + timedelta(minutes=TOLERANCIA_TARDE_MINUTOS)
+        ventana_fin = base_fin
+    turno_nombre = clase.comision.turno.nombre if clase.comision and clase.comision.turno_id else ""
+    return ventana_inicio, umbral_tarde, ventana_fin, turno_nombre
+
+
+@transaction.atomic
+def generate_classes_for_date(target_date: date, *, comision_ids: Sequence[int] | None = None) -> list[ClaseGenerada]:
+    """
+    Crea (si no existen) las ClaseProgramada según los snapshots del día indicado.
+
+    También prepara registros de asistencia de estudiantes con estado "ausente" por defecto,
+    dejando todo listo para que el docente marque presentes.
+    """
+    weekday = target_date.weekday()  # 0 = lunes
+    horario_qs = CursoHorarioSnapshot.objects.filter(dia_semana=weekday)
+    if comision_ids:
+        horario_qs = horario_qs.filter(comision_id__in=comision_ids)
+
+    # Determinar cuatrimestre activo consultando el Calendario Académico oficial configurado (VentanaHabilitacion)
+    # y contrastando la target_date contra los rangos oficiales de 1C y 2C:
+    ventana_1c = VentanaHabilitacion.objects.filter(
+        tipo=VentanaHabilitacion.Tipo.CALENDARIO_CUATRIMESTRE,
+        periodo="1C",
+        desde__lte=target_date,
+        hasta__gte=target_date,
+    ).first()
+
+    ventana_2c = VentanaHabilitacion.objects.filter(
+        tipo=VentanaHabilitacion.Tipo.CALENDARIO_CUATRIMESTRE,
+        periodo="2C",
+        desde__lte=target_date,
+        hasta__gte=target_date,
+    ).first()
+
+    if ventana_1c and not ventana_2c:
+        cuatrimestres_validos = {"PCU", "1C", "ANU", "", None}
+    elif ventana_2c and not ventana_1c:
+        cuatrimestres_validos = {"SCU", "2C", "ANU", "", None}
+    else:
+        # Si cae fuera de rango o no hay ventana explícita, fallback según mes
+        if target_date.month <= 7:
+            cuatrimestres_validos = {"PCU", "1C", "ANU", "", None}
+        else:
+            cuatrimestres_validos = {"SCU", "2C", "ANU", "", None}
+
+    eventos_dia = _eventos_para_fecha(target_date)
+
+    generadas: list[ClaseGenerada] = []
+    for horario in horario_qs.select_related(
+        "comision",
+        "comision__docente",
+        "comision__turno",
+        "comision__materia",
+        "comision__materia__plan_de_estudio__profesorado",
+    ):
+        comision = horario.comision
+        if comision.estado != Comision.Estado.ABIERTA:
+            continue
+
+        # Validar compatibilidad de cuatrimestre según el régimen de la materia o horario
+        regimen = getattr(comision.materia, "regimen", None)
+        if regimen and regimen not in cuatrimestres_validos:
+            continue
+
+        turno_id = horario.comision.turno_id
+        contexto = _contexto_para_horario(horario)
+        evento_doc = _buscar_evento_que_aplica(
+            eventos_dia,
+            fecha=target_date,
+            turno_id=turno_id,
+            campo="aplica_docentes",
+            contexto=contexto,
+        )
+        evento_est = _buscar_evento_que_aplica(
+            eventos_dia,
+            fecha=target_date,
+            turno_id=turno_id,
+            campo="aplica_estudiantes",
+            contexto=contexto,
+        )
+
+        if evento_doc or evento_est:
+            clase_existente = ClaseProgramada.objects.filter(
+                comision=horario.comision,
+                fecha=target_date,
+                hora_inicio=horario.hora_inicio,
+                hora_fin=horario.hora_fin,
+            ).first()
+            if clase_existente:
+                _aplicar_evento_sobre_clase(
+                    clase_existente,
+                    evento_docentes=evento_doc,
+                    evento_estudiantes=evento_est,
+                )
+                generadas.append(ClaseGenerada(clase=clase_existente, creada=False))
+            continue
+
+        docente = horario.comision.docente
+        defaults = {
+            "hora_inicio": horario.hora_inicio,
+            "hora_fin": horario.hora_fin,
+            "docente": docente,
+            "docente_dni": docente.dni if docente else "",
+            "docente_nombre": _docente_nombre_snapshot(docente),
+        }
+
+        clase, created = ClaseProgramada.objects.get_or_create(
+            comision=horario.comision,
+            fecha=target_date,
+            hora_inicio=horario.hora_inicio,
+            hora_fin=horario.hora_fin,
+            defaults=defaults,
+        )
+
+        if not created and docente and clase.docente_id != docente.id:
+            clase.docente = docente
+            clase.docente_dni = docente.dni
+            clase.docente_nombre = _docente_nombre_snapshot(docente)
+            clase.save(update_fields=["docente", "docente_dni", "docente_nombre", "actualizado_en"])
+        elif created is False and clase.estado == ClaseProgramada.Estado.CANCELADA:
+            clase.estado = ClaseProgramada.Estado.PROGRAMADA
+            if clase.notas and clase.notas.startswith(EVENT_NOTE_PREFIX):
+                clase.notas = ""
+            clase.save(update_fields=["estado", "notas", "actualizado_en"])
+
+        _ensure_asistencias_estudiantes(clase)
+        _ensure_asistencia_docente(clase)
+
+        generadas.append(ClaseGenerada(clase=clase, creada=created))
+
+    return generadas
+
+
+def generate_classes_for_range(
+    start: date, end: date, *, comision_ids: Sequence[int] | None = None
+) -> list[ClaseGenerada]:
+    """
+    Genera clases programadas para un rango de fechas (inclusive).
+    """
+    current = start
+    generadas: list[ClaseGenerada] = []
+    while current <= end:
+        generadas.extend(generate_classes_for_date(current, comision_ids=comision_ids))
+        current += timedelta(days=1)
+    return generadas
+
+
+def _ensure_asistencias_estudiantes(clase: ClaseProgramada) -> None:
+    snapshot_qs = CursoEstudianteSnapshot.objects.filter(comision=clase.comision, activo=True)
+
+    for snapshot in snapshot_qs:
+        estudiante = _resolver_estudiante(snapshot)
+        if not estudiante:
+            continue
+
+        AsistenciaEstudiante.objects.get_or_create(
+            clase=clase,
+            estudiante=estudiante,
+            defaults={
+                "estado": AsistenciaEstudiante.Estado.AUSENTE,
+                "registrado_via": AsistenciaEstudiante.RegistradoVia.SISTEMA,
+            },
+        )
+
+
+def _ensure_asistencia_docente(clase: ClaseProgramada) -> None:
+    docente = clase.docente
+    if not docente:
+        return
+    AsistenciaDocente.objects.get_or_create(
+        clase=clase,
+        docente=docente,
+        defaults={
+            "estado": AsistenciaDocente.Estado.AUSENTE,
+            "registrado_via": AsistenciaDocente.RegistradoVia.SISTEMA,
+        },
+    )
+
+
+def registrar_log_docente(
+    *,
+    dni: str,
+    resultado: DocenteMarcacionLog.Resultado,
+    docente: Docente | None = None,
+    clase: ClaseProgramada | None = None,
+    detalle: str = "",
+    alerta: bool = False,
+    origen: str = "kiosk",
+) -> DocenteMarcacionLog:
+    return DocenteMarcacionLog.objects.create(
+        dni=dni,
+        docente=docente,
+        clase=clase,
+        resultado=resultado,
+        detalle=detalle[:255],
+        alerta=alerta,
+        origen=origen,
+    )
+
+
+@transaction.atomic
+def sync_course_snapshots(*, comisiones: Iterable[Comision] | None = None, anio: int | None = None) -> None:
+    """
+    Actualiza las tablas snapshot (horarios y estudiantes) a partir de las comisiones reales.
+    """
+    comision_qs = comisiones if comisiones is not None else Comision.objects.all()
+    for comision in comision_qs:
+        _sync_horarios_snapshot(comision)
+        _sync_estudiantes_snapshot(comision, anio=anio)
+
+
+def _sync_horarios_snapshot(comision: Comision) -> None:
+    CursoHorarioSnapshot.objects.filter(comision=comision).delete()
+
+    if not comision.horario_id:
+        return
+
+    detalles = comision.horario.detalles.select_related("bloque")
+    bulk = [
+        CursoHorarioSnapshot(
+            comision=comision,
+            dia_semana=(detalle.bloque.dia - 1) % 7,
+            hora_inicio=detalle.bloque.hora_desde,
+            hora_fin=detalle.bloque.hora_hasta,
+            origen_id=str(detalle.id),
+        )
+        for detalle in detalles
+    ]
+    if bulk:
+        CursoHorarioSnapshot.objects.bulk_create(bulk, ignore_conflicts=True)
+
+
+def _sync_estudiantes_snapshot(comision: Comision, *, anio: int | None = None) -> None:
+    CursoEstudianteSnapshot.objects.filter(comision=comision).delete()
+
+    inscripciones = comision.inscripciones.filter(
+        estado=InscripcionMateriaEstudiante.Estado.CONFIRMADA,
+    )
+    if anio is not None:
+        inscripciones = inscripciones.filter(anio=anio)
+
+    bulk = []
+    for inscripcion in inscripciones.select_related("estudiante__persona"):
+        estudiante = inscripcion.estudiante
+        nombre = estudiante.nombre
+        apellido = estudiante.apellido
+        bulk.append(
+            CursoEstudianteSnapshot(
+                comision=comision,
+                estudiante=estudiante,
+                dni=estudiante.dni,
+                nombre=nombre or estudiante.dni,
+                apellido=apellido or "",
+                activo=True,
+            )
+        )
+    if bulk:
+        CursoEstudianteSnapshot.objects.bulk_create(bulk, ignore_conflicts=True)
+
+
+@transaction.atomic
+def apply_justification(justificacion: Justificacion) -> None:
+    """
+    Aplica el efecto de una justificación aprobada sobre las asistencias registradas.
+    """
+    detalles = justificacion.detalles.select_related("clase", "estudiante", "docente")
+
+    for detalle in detalles:
+        clase = detalle.clase
+        if justificacion.tipo == Justificacion.Tipo.ESTUDIANTE and detalle.estudiante:
+            asistencia, _ = AsistenciaEstudiante.objects.get_or_create(
+                clase=clase,
+                estudiante=detalle.estudiante,
+                defaults={
+                    "estado": AsistenciaEstudiante.Estado.AUSENTE,
+                    "registrado_via": AsistenciaEstudiante.RegistradoVia.SISTEMA,
+                },
+            )
+            asistencia.estado = AsistenciaEstudiante.Estado.AUSENTE_JUSTIFICADA
+            asistencia.justificacion = justificacion
+            asistencia.save(update_fields=["estado", "justificacion", "registrado_en"])
+
+        if justificacion.tipo == Justificacion.Tipo.DOCENTE and detalle.docente:
+            asistencia, _ = AsistenciaDocente.objects.get_or_create(
+                clase=clase,
+                docente=detalle.docente,
+                defaults={
+                    "estado": AsistenciaDocente.Estado.AUSENTE,
+                    "registrado_via": AsistenciaDocente.RegistradoVia.SISTEMA,
+                },
+            )
+            asistencia.estado = AsistenciaDocente.Estado.JUSTIFICADA
+            asistencia.justificacion = justificacion
+            asistencia.save(update_fields=["estado", "justificacion", "registrado_en"])
+
+
+def attach_classes_to_justification(
+    justificacion: Justificacion,
+    *,
+    comision: Comision,
+    estudiante: Estudiante | None = None,
+    docente: Docente | None = None,
+) -> list[JustificacionDetalle]:
+    """
+    Crea (si no existen) los detalles de una justificación para cada clase del rango de vigencia.
+    """
+    clases = ClaseProgramada.objects.filter(
+        comision=comision,
+        fecha__range=(justificacion.vigencia_desde, justificacion.vigencia_hasta),
+    )
+    detalles_creados: list[JustificacionDetalle] = []
+    for clase in clases:
+        detalle, created = JustificacionDetalle.objects.get_or_create(
+            justificacion=justificacion,
+            clase=clase,
+            estudiante=estudiante,
+            docente=docente,
+        )
+        if created:
+            detalles_creados.append(detalle)
+    return detalles_creados
+
+
+def propagar_asistencia_docente_turno(
+    clase_origen: ClaseProgramada,
+    docente: Docente,
+    estado_origen: AsistenciaDocente.Estado,
+    registrado_por,
+    observaciones: str = "",
+    marcacion_categoria: str = AsistenciaDocente.MarcacionCategoria.NORMAL,
+    alerta: bool = False,
+    alerta_tipo: str = "",
+    alerta_motivo: str = "",
+) -> None:
+    """
+    Propaga la marcación de asistencia del docente a otras clases del mismo turno.
+    Reglas:
+    - Clases futuras (hora_inicio > ahora): Se marcan PRESENTE.
+    - Clases pasadas (hora_fin < ahora): Si no tienen marca, se marcan AUSENTE.
+    - Clases concurrentes/mismo bloque: Se marcan igual que la origen.
+    """
+    turno = clase_origen.comision.turno if clase_origen.comision_id else None
+
+    # Buscamos todas las clases del docente en esa fecha y turno (o sin turno si es null)
+    # Excluimos la clase origen que ya fue procesada
+    otras_clases = ClaseProgramada.objects.filter(
+        docente=docente, fecha=clase_origen.fecha, comision__turno=turno
+    ).exclude(id=clase_origen.id)
+
+    ahora = timezone.now()
+    if settings.USE_TZ:
+        ahora = timezone.localtime(ahora)
+
+    # Convertimos 'ahora' a time para comparar con hora_inicio/fin
+    ahora_time = ahora.time()
+
+    for otra_clase in otras_clases:
+        # Determinar estado para esta otra clase
+        nuevo_estado = None
+        nueva_observacion = observaciones
+        es_futura = False
+
+        if otra_clase.hora_inicio and otra_clase.hora_inicio > ahora_time:
+            # Clase futura: Se asume presente si marcó en el turno
+            nuevo_estado = AsistenciaDocente.Estado.PRESENTE
+            nueva_observacion = f"Propagado desde {clase_origen.hora_inicio}"
+            es_futura = True
+
+        elif otra_clase.hora_fin and otra_clase.hora_fin < ahora_time:
+            # Clase pasada: Si ya pasó y no marcó antes, es Ausente.
+            nuevo_estado = AsistenciaDocente.Estado.AUSENTE
+            nueva_observacion = "No marcó asistencia a tiempo (turno vencido)"
+
+        else:
+            # Clase actual/concurrente: Copiamos el estado de la origen
+            nuevo_estado = estado_origen
+            nueva_observacion = f"Propagado (concurrente) desde {clase_origen.hora_inicio}"
+
+        # Aplicar cambios
+        asistencia, created = AsistenciaDocente.objects.get_or_create(
+            clase=otra_clase,
+            docente=docente,
+            defaults={
+                "estado": AsistenciaDocente.Estado.AUSENTE,  # Default seguro
+                "registrado_via": AsistenciaDocente.RegistradoVia.SISTEMA,
+            },
+        )
+
+        # Si ya estaba PRESENTE, no la tocamos (quizás marcó esa específicamente antes).
+        if asistencia.estado == AsistenciaDocente.Estado.PRESENTE and not created:
+            continue
+
+        asistencia.estado = nuevo_estado
+        asistencia.observaciones = nueva_observacion
+        asistencia.registrado_via = AsistenciaDocente.RegistradoVia.SISTEMA
+        asistencia.registrado_por = registrado_por
+        asistencia.registrado_en = ahora
+
+        # Limpiamos alertas para las propagadas futuras (asumimos que llega bien)
+        if es_futura:
+            asistencia.alerta = False
+            asistencia.alerta_tipo = ""
+            asistencia.alerta_motivo = ""
+            asistencia.marcacion_categoria = AsistenciaDocente.MarcacionCategoria.NORMAL
+        elif nuevo_estado == estado_origen:
+            # Copiar alertas si es concurrente
+            asistencia.alerta = alerta
+            asistencia.alerta_tipo = alerta_tipo
+            asistencia.alerta_motivo = alerta_motivo
+            asistencia.marcacion_categoria = marcacion_categoria
+
+        asistencia.save()
+
+
+def propagar_asistencia_estudiantes_bloques(
+    clase_origen: ClaseProgramada,
+    registrado_por=None,
+    *,
+    estudiante_id: int | None = None,
+) -> None:
+    """
+    Propaga la asistencia de los estudiantes desde la clase origen hacia los demás bloques
+    de la misma comisión y misma fecha (tanto posteriores como anteriores si no tenían toma manual).
+
+    Regla pedagógica institucional (Opción A, con excepción por PIN):
+    Cuando el docente toma asistencia en cualquier bloque del día, se asume que está registrando
+    la jornada completa de esa comisión. Todos los bloques de ese día quedan sincronizados
+    con los presentes/ausentes de la jornada — CON UNA EXCEPCIÓN para los bloques ANTERIORES
+    al bloque donde se marcó: si esos bloques anteriores tuvieron un PIN generado en algún
+    momento (el estudiante tuvo la oportunidad real de marcar y no lo hizo), quedan AUSENTE en
+    vez de PRESENTE. Si esos bloques anteriores nunca tuvieron un PIN generado (el docente nunca
+    abrió la asistencia ahí, no hubo oportunidad de marcar), se mantiene el criterio original y
+    quedan PRESENTE — no es responsabilidad del estudiante que el docente no haya abierto la
+    asistencia a tiempo. Los bloques POSTERIORES al de origen siempre se propagan como PRESENTE,
+    sin esta excepción.
+
+    estudiante_id (opcional): si se pasa, la propagación se acota a ESE estudiante
+    únicamente, sin tocar a nadie más. Se usa cuando el origen de la llamada es la
+    marcación individual de un solo estudiante (ej. PIN): antes, cualquier marcación
+    individual releía el estado de TODO el curso en clase_origen y resincronizaba a
+    todos los demás — bastaba que UN estudiante marcara en un bloque tardío para que,
+    de paso, se les borrara (pasara a ausente) la presencia ya registrada correctamente
+    en un bloque anterior a compañeros que simplemente todavía no habían marcado en
+    este bloque. Cuando la carga es manual de todo el curso a la vez (el docente tilda
+    presentes/ausentes de su bloque completo), sí corresponde re-sincronizar a todos:
+    ahí se deja estudiante_id=None (comportamiento sin cambios).
+    """
+    if not clase_origen.hora_inicio:
+        return
+
+    # Buscar todos los otros bloques de la misma comisión en la misma fecha
+    otros_bloques = (
+        ClaseProgramada.objects.filter(
+            comision_id=clase_origen.comision_id,
+            fecha=clase_origen.fecha,
+        )
+        .exclude(id=clase_origen.id)
+        .order_by("hora_inicio")
+    )
+
+    if not otros_bloques.exists():
+        return
+
+    # Obtener las asistencias registradas en la clase origen
+    asistencias_origen = AsistenciaEstudiante.objects.filter(clase=clase_origen).select_related("estudiante")
+    if estudiante_id is not None:
+        asistencias_origen = asistencias_origen.filter(estudiante_id=estudiante_id)
+    mapa_estados = {a.estudiante_id: a.estado for a in asistencias_origen}
+
+    now = timezone.now()
+
+    for bloque in otros_bloques:
+        _ensure_asistencias_estudiantes(bloque)
+        registros_bloque = AsistenciaEstudiante.objects.filter(clase=bloque)
+
+        for reg in registros_bloque:
+            if reg.justificacion_id or reg.estado == AsistenciaEstudiante.Estado.AUSENTE_JUSTIFICADA:
+                continue
+
+            estado_origen = mapa_estados.get(reg.estudiante_id)
+            if not estado_origen:
+                continue
+
+            # Si en el bloque origen estuvo PRESENTE o TARDE, en los demás bloques es PRESENTE...
+            if estado_origen in [AsistenciaEstudiante.Estado.PRESENTE, AsistenciaEstudiante.Estado.TARDE]:
+                es_bloque_anterior = bool(bloque.hora_inicio) and bloque.hora_inicio < clase_origen.hora_inicio
+                tuvo_pin_disponible = bloque.pin_asistencia is not None
+                if es_bloque_anterior and tuvo_pin_disponible:
+                    # El estudiante tuvo la oportunidad de marcar en este bloque anterior
+                    # (el docente sí generó PIN ahí) y no lo hizo: queda ausente ese bloque,
+                    # no se le regala presente por haber marcado más tarde.
+                    nuevo_estado = AsistenciaEstudiante.Estado.AUSENTE
+                else:
+                    nuevo_estado = AsistenciaEstudiante.Estado.PRESENTE
+            else:
+                nuevo_estado = AsistenciaEstudiante.Estado.AUSENTE
+
+            if reg.estado != nuevo_estado:
+                reg.estado = nuevo_estado
+                reg.registrado_via = AsistenciaEstudiante.RegistradoVia.STAFF
+                reg.registrado_por = registrado_por
+                reg.registrado_en = now
+                reg.save(update_fields=["estado", "registrado_via", "registrado_por", "registrado_en"])

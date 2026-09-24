@@ -1,0 +1,167 @@
+from django.contrib.auth.models import Group, User
+from django.db import IntegrityError
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
+from ninja import Router
+from ninja.errors import HttpError
+
+from core.auth_ninja import JWTAuth
+from core.models import Docente, Persona, Profesorado, StaffAsignacion
+from core.permissions import (
+    allowed_profesorados,
+    can,
+    ensure_profesorado_access,
+    require,
+)
+
+from .schemas import DocenteIn, DocenteOut, DocenteRoleAssignIn, DocenteRoleAssignOut
+from .services.docente_service import DocenteService
+
+
+def _ensure_structure_view(user):
+    require(user, "ver_estructura")
+
+
+def _ensure_structure_edit(user):
+    require(user, "editar_estructura")
+
+
+router = Router(tags=["Docentes"])
+
+from apps.estudiantes.schemas.trayectoria import HorarioTabla
+
+from .horarios_api import get_mis_horarios
+
+# Registrada como operacion nativa del router (no via add_router) y antes de
+# "/{docente_id}": Ninja arma primero las rutas propias del router y recien
+# despues las de sub-routers agregados con add_router, sin importar el orden
+# en que aparezcan en el archivo. Como "/{docente_id}" no tiene un converter
+# de tipo en la URL de Django (Ninja valida el tipo recien con Pydantic), si
+# quedara antes matchea "mis-horarios" como si fuera un docente_id y
+# responde 422 en vez de resolver la ruta correcta.
+router.get("/mis-horarios", response=list[HorarioTabla], auth=JWTAuth())(get_mis_horarios)
+
+
+@router.get("/", response=list[DocenteOut], auth=JWTAuth())
+def list_docentes(request):
+    _ensure_structure_view(request.user)
+    is_admin = can(request.user, "gestionar_staff") or can(request.user, "editar_estructura")
+    docentes = (
+        Docente.objects.select_related("persona")
+        .exclude(
+            Q(persona__dni__startswith="DOC-HIS-")
+            | Q(persona__apellido__icontains="CARGA HISTÓRICA")
+            | Q(persona__apellido__icontains="SISTEMA")
+        )
+        .order_by("persona__apellido", "persona__nombre")
+    )
+    return [DocenteService.serialize_docente(d, is_admin=is_admin) for d in docentes]
+
+
+@router.post("/", response=DocenteOut, auth=JWTAuth())
+def create_docente(request, payload: DocenteIn):
+    _ensure_structure_edit(request.user)
+    try:
+        persona = Persona.objects.create(**payload.dict())
+    except IntegrityError:
+        existing = Persona.objects.filter(dni=payload.dni).first()
+        if existing:
+            has_docente = False
+            try:
+                existing.docente_perfil
+                has_docente = True
+            except Exception:
+                pass
+
+            if has_docente:
+                raise HttpError(
+                    409,
+                    f"El DNI '{payload.dni}' ya está registrado como docente: {existing.apellido}, {existing.nombre}.",
+                )
+
+            # Es estudiante (u otro), pero no docente. Actualizamos y creamos el perfil.
+            for attr, value in payload.dict().items():
+                if hasattr(existing, attr):
+                    setattr(existing, attr, value)
+            existing.save()
+            persona = existing
+        else:
+            raise HttpError(409, f"El DNI '{payload.dni}' ya está en uso.")
+    docente = Docente.objects.create(persona=persona)
+    user, _, temp_password = DocenteService.ensure_user_for_docente(docente)
+    DocenteService.ensure_docente_group(user)
+    return DocenteService.serialize_docente(docente, temp_password=temp_password, is_admin=True)
+
+
+@router.get("/{docente_id}", response=DocenteOut, auth=JWTAuth())
+def get_docente(request, docente_id: int):
+    _ensure_structure_view(request.user)
+    is_admin = can(request.user, "gestionar_staff") or can(request.user, "editar_estructura")
+    docente = get_object_or_404(Docente, id=docente_id)
+    return DocenteService.serialize_docente(docente, is_admin=is_admin)
+
+
+@router.put("/{docente_id}", response=DocenteOut, auth=JWTAuth())
+def update_docente(request, docente_id: int, payload: DocenteIn):
+    _ensure_structure_edit(request.user)
+    docente = get_object_or_404(Docente, id=docente_id)
+    persona = docente.persona
+    for attr, value in payload.dict().items():
+        if hasattr(persona, attr):
+            setattr(persona, attr, value)
+    try:
+        persona.save()
+    except IntegrityError:
+        existing = Persona.objects.filter(dni=payload.dni).first()
+        if existing:
+            parts = []
+            try:
+                existing.docente_perfil
+                parts.append("docente")
+            except Exception:
+                pass
+            try:
+                existing.estudiante_perfil
+                parts.append("estudiante")
+            except Exception:
+                pass
+            quien = " y ".join(parts) if parts else "otra persona"
+            raise HttpError(
+                409, f"El DNI '{payload.dni}' ya está registrado como {quien}: {existing.apellido}, {existing.nombre}."
+            )
+        raise HttpError(409, f"El DNI '{payload.dni}' ya está en uso.")
+    return DocenteService.serialize_docente(docente, is_admin=True)
+
+
+@router.delete("/{docente_id}", response={204: None}, auth=JWTAuth())
+def delete_docente(request, docente_id: int):
+    _ensure_structure_edit(request.user)
+    docente = get_object_or_404(Docente.objects.select_related("persona"), id=docente_id)
+
+    doc_nom = (
+        f"{docente.persona.apellido}, {docente.persona.nombre} (DNI: {docente.persona.dni})"
+        if docente.persona
+        else f"Docente ID {docente.id}"
+    )
+    before_state = {
+        "docente_id": docente.id,
+        "nombre": docente.persona.nombre if docente.persona else "",
+        "apellido": docente.persona.apellido if docente.persona else "",
+        "dni": docente.persona.dni if docente.persona else "",
+        "email": docente.persona.email if docente.persona else "",
+    }
+
+    from apps.common.audit import log_action_from_request
+
+    log_action_from_request(
+        request,
+        accion="DELETE",
+        tipo_accion="CRUD",
+        detalle_accion=f"Eliminó docente: {doc_nom}",
+        entidad="Docente",
+        entidad_id=docente.id,
+        before=before_state,
+    )
+
+    docente.delete()
+    return 204, None

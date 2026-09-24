@@ -1,0 +1,316 @@
+from typing import Any
+
+from ninja import Field, Schema
+
+from apps.estudiantes.schemas.regularidad import RegularidadEstudianteOut
+
+# ==========================================
+# 11. ESTUDIANTES (ADMINISTRACIÓN)
+# ==========================================
+
+
+class RegularidadResumen(Schema):
+    id: int
+    materia_id: int
+    materia_nombre: str
+    situacion: str
+    situacion_display: str
+    fecha_cierre: str
+    nota_tp: float | None = None
+    nota_final: int | None = None
+    asistencia: int | None = None
+    excepcion: bool = False
+    observaciones: str | None = None
+    aprobada: bool = False
+    en_resguardo: bool = False
+    vigencia_hasta: str | None = None
+    vigente: bool | None = None
+    dias_restantes: int | None = None
+
+
+class EstudianteAdminDocumentacion(Schema):
+    dni_legalizado: Any | None = None
+    fotos_4x4: Any | None = None
+    certificado_salud: Any | None = None
+    folios_oficio: Any | None = None
+    titulo_secundario_legalizado: Any | None = None
+    certificado_titulo_en_tramite: Any | None = None
+    analitico_legalizado: Any | None = None
+    certificado_alumno_regular_sec: Any | None = None
+    adeuda_materias: Any | None = None
+    adeuda_materias_detalle: Any | None = None
+    escuela_secundaria: Any | None = None
+    es_certificacion_docente: Any | None = None
+    titulo_terciario_univ: Any | None = None
+    incumbencia: Any | None = None
+    articulo_7: Any | None = None
+
+
+class CarreraStatus(Schema):
+    profesorado_id: int
+    nombre: str
+    estado_academico: str
+    estado_academico_display: str
+    condicion: str
+    estado_legajo: str = "PEN"
+    documentacion: EstudianteAdminDocumentacion | None = None
+    curso_introductorio_aprobado: bool = False
+    libreta_entregada: bool = False
+
+
+class EstudianteAdminListItem(Schema):
+    dni: str
+    apellido: str
+    nombre: str
+    email: str | None = None
+    telefono: str | None = None
+    estado_legajo: str
+    estado_legajo_display: str
+    carreras: list[str] = Field(default_factory=list)
+    carreras_detalle: list[CarreraStatus] = Field(default_factory=list)
+    legajo: str | None = None
+    anio_ingreso: int | None = None
+    activo: bool = True
+
+
+class EstudianteAdminListResponse(Schema):
+    total: int
+    items: list[EstudianteAdminListItem] = Field(default_factory=list)
+
+
+class EstudianteDocumentacionListItem(Schema):
+    dni: str
+    apellido: str
+    nombre: str
+    email: str
+    fecha_inscripcion: str | None = None
+    condicion_administrativa: str
+    curso_introductorio_aprobado: bool
+    libreta_entregada: bool
+    dni_legalizado: bool
+    fotos_4x4: bool
+    certificado_salud: bool
+    folios_oficio: bool
+    titulo_secundario_ok: bool
+    articulo_7: bool
+
+
+class EstudianteDocumentacionListResponse(Schema):
+    total: int
+    items: list[EstudianteDocumentacionListItem] = Field(default_factory=list)
+
+
+class EstudianteDocumentacionUpdateIn(Schema):
+    curso_introductorio_aprobado: bool | None = None
+    libreta_entregada: bool | None = None
+    dni_legalizado: bool | None = None
+    fotos_4x4: bool | None = None
+    certificado_salud: bool | None = None
+    folios_oficio: bool | None = None
+    titulo_secundario_ok: bool | None = None
+    articulo_7: bool | None = None
+
+
+class EstudianteDocumentacionBulkUpdateItem(Schema):
+    dni: str
+    changes: EstudianteDocumentacionUpdateIn
+
+
+class EstudianteDocumentacionBulkUpdateIn(Schema):
+    updates: list[EstudianteDocumentacionBulkUpdateItem]
+
+
+class EstudianteAdminDetail(Schema):
+    dni: str
+    apellido: str
+    nombre: str
+    foto_url: str | None = None
+    email: str | None = None
+    telefono: str | None = None
+    domicilio: str | None = None
+    fecha_nacimiento: str | None = None
+    lugar_nacimiento: str | None = None
+    genero: str | None = None
+    estado_legajo: str
+    estado_legajo_display: str
+    must_change_password: bool
+    activo: bool = True
+    carreras: list[str] = Field(default_factory=list)
+    carreras_detalle: list[CarreraStatus] = Field(default_factory=list)
+    legajo: str | None = None
+    datos_extra: dict[str, Any] = Field(default_factory=dict)
+    documentacion: EstudianteAdminDocumentacion | None = None
+    condicion_calculada: str | None = None
+    curso_introductorio_aprobado: bool | None = None
+    libreta_entregada: bool | None = None
+    autorizado_rendir: bool = False
+    autorizado_rendir_observacion: str | None = None
+    materias_autorizadas: list[int] = Field(default_factory=list)
+    regularidades: list[RegularidadResumen] = Field(default_factory=list)
+    # Identidad extendida
+    cuil: str | None = None
+    nacionalidad: str | None = None
+    estado_civil: str | None = None
+    localidad_nac: str | None = None
+    provincia_nac: str | None = None
+    pais_nac: str | None = None
+    # Contacto de emergencia
+    emergencia_telefono: str | None = None
+    emergencia_parentesco: str | None = None
+    # Salud y accesibilidad
+    cud_informado: bool = False
+    condicion_salud_informada: bool = False
+    condicion_salud_detalle: str | None = None
+    # Estudios secundarios
+    sec_titulo: str | None = None
+    sec_establecimiento: str | None = None
+    sec_fecha_egreso: str | None = None
+    sec_localidad: str | None = None
+    sec_provincia: str | None = None
+    sec_pais: str | None = None
+    # Estudios superiores previos
+    sup1_titulo: str | None = None
+    sup1_establecimiento: str | None = None
+    sup1_fecha_egreso: str | None = None
+    sup1_localidad: str | None = None
+    sup1_provincia: str | None = None
+    sup1_pais: str | None = None
+    # Situación laboral
+    trabaja: bool = False
+    empleador: str | None = None
+    horario_trabajo: str | None = None
+    domicilio_trabajo: str | None = None
+
+
+EstudianteAdminDetail.model_rebuild()
+
+
+class CarreraUpdateIn(Schema):
+    profesorado_id: int
+    estado_academico: str | None = None
+    force_baja_materias: bool = False
+    nombre: str | None = None
+    condicion: str | None = None
+
+
+class EstudianteAdminUpdateIn(Schema):
+    dni: str | None = None
+    apellido: str | None = None
+    nombre: str | None = None
+    email: str | None = None
+    telefono: str | None = None
+    domicilio: str | None = None
+    estado_legajo: Any | None = None
+    must_change_password: bool | None = None
+    activo: bool | None = None
+    fecha_nacimiento: str | None = None
+    lugar_nacimiento: str | None = None
+    profesorado_id: int | None = None
+    documentacion: EstudianteAdminDocumentacion | None = None
+    anio_ingreso: Any | None = None
+    genero: str | None = None
+    rol_extra: str | None = None
+    observaciones: str | None = None
+    cuil: str | None = None
+    curso_introductorio_aprobado: bool | None = None
+    libreta_entregada: bool | None = None
+    # Datos personales adicionales
+    nacionalidad: str | None = None
+    estado_civil: str | None = None
+    localidad_nac: str | None = None
+    provincia_nac: str | None = None
+    pais_nac: str | None = None
+    # Emergencia
+    emergencia_telefono: str | None = None
+    emergencia_parentesco: str | None = None
+    # Secundario
+    sec_titulo: str | None = None
+    sec_establecimiento: str | None = None
+    sec_fecha_egreso: str | None = None
+    sec_localidad: str | None = None
+    sec_provincia: str | None = None
+    sec_pais: str | None = None
+    # Superiores
+    sup1_titulo: str | None = None
+    sup1_establecimiento: str | None = None
+    sup1_fecha_egreso: str | None = None
+    sup1_localidad: str | None = None
+    sup1_provincia: str | None = None
+    sup1_pais: str | None = None
+    # Accesibilidad
+    cud_informado: bool | None = None
+    condicion_salud_informada: bool | None = None
+    condicion_salud_detalle: str | None = None
+    # Laborales
+    trabaja: bool | None = None
+    empleador: str | None = None
+    horario_trabajo: str | None = None
+    domicilio_trabajo: str | None = None
+    # Updates for specific careers
+    carreras_update: list[CarreraUpdateIn] | None = None
+
+
+class PerfilEstudianteUpdateIn(Schema):
+    """Schema estricto para que el estudiante complete o actualice su perfil propio (autoservicio).
+    Excluye campos administrativos, académicos, de estado de legajo, o de seguridad."""
+
+    telefono: str | None = None
+    domicilio: str | None = None
+    fecha_nacimiento: str | None = None
+    lugar_nacimiento: str | None = None
+    genero: str | None = None
+    # Datos personales adicionales
+    nacionalidad: str | None = None
+    estado_civil: str | None = None
+    localidad_nac: str | None = None
+    provincia_nac: str | None = None
+    pais_nac: str | None = None
+    # Emergencia
+    emergencia_telefono: str | None = None
+    emergencia_parentesco: str | None = None
+    # Secundario
+    sec_titulo: str | None = None
+    sec_establecimiento: str | None = None
+    sec_fecha_egreso: str | None = None
+    sec_localidad: str | None = None
+    sec_provincia: str | None = None
+    sec_pais: str | None = None
+    # Superiores
+    sup1_titulo: str | None = None
+    sup1_establecimiento: str | None = None
+    sup1_fecha_egreso: str | None = None
+    sup1_localidad: str | None = None
+    sup1_provincia: str | None = None
+    sup1_pais: str | None = None
+    # Accesibilidad y salud
+    cud_informado: bool | None = None
+    condicion_salud_informada: bool | None = None
+    condicion_salud_detalle: str | None = None
+    # Laborales
+    trabaja: bool | None = None
+    empleador: str | None = None
+    horario_trabajo: str | None = None
+    domicilio_trabajo: str | None = None
+
+
+class AutorizarRendirIn(Schema):
+    autorizado: bool
+    observacion: str | None = None
+    materias_autorizadas: list[int] = Field(default_factory=list)
+
+
+class ProrrogaTituloIn(Schema):
+    fecha_otorgada: str
+    fecha_vencimiento: str
+    observaciones: str | None = None
+
+
+class ProrrogaTituloOut(Schema):
+    id: int
+    fecha_otorgada: str
+    fecha_vencimiento: str
+    observaciones: str | None = None
+    autorizado_por_nombre: str | None = None
+    vigente: bool
+    dias_restantes: int
+    created_at: str

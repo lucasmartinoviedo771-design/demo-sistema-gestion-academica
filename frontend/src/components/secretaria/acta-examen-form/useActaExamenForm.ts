@@ -1,0 +1,1066 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import dayjs from "dayjs";
+import { enqueueSnackbar } from "notistack";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getErrorStatus } from "@/utils/errors";
+import { clearDraft, loadDraft, saveDraft } from "@/utils/formDraft";
+
+import {
+	type ActaCreatePayload,
+	type ActaEstudiantePayload,
+	type ActaMetadataDTO,
+	actualizarActaExamen,
+	buscarMesaPorCodigo,
+	crearActaExamen,
+	fetchActaMetadata,
+	guardarActaOral,
+	guardarBorradorActaFinal,
+	type MesaResumenDTO,
+	obtenerActa,
+	obtenerActaOral,
+	obtenerBorradorActaFinal,
+} from "@/api/cargaNotas";
+import { fetchEstudianteAdminDetail } from "@/api/estudiantes";
+import type { OralActFormValues } from "@/components/secretaria/OralExamActaDialog";
+
+import {
+	type ActaExamenFormProps,
+	type DocenteState,
+	EstudiantePreseleccionado,
+	type EstudianteState,
+} from "./types";
+import {
+	clasificarNota,
+	createEmptyDocentes,
+	createEmptyEstudiante,
+} from "./utils";
+
+export function useActaExamenForm({
+	strict = true,
+	successMessage = "Acta generada correctamente.",
+	editId,
+	mesaPreseleccionada,
+	estudiantesPreseleccionados,
+}: Pick<
+	ActaExamenFormProps,
+	| "strict"
+	| "successMessage"
+	| "editId"
+	| "mesaPreseleccionada"
+	| "estudiantesPreseleccionados"
+>) {
+	const queryClient = useQueryClient();
+	const metadataQuery = useQuery<ActaMetadataDTO>({
+		queryKey: ["acta-examen-metadata"],
+		queryFn: fetchActaMetadata,
+	});
+
+	const [tipo, setTipo] = useState<"REG" | "LIB">("REG");
+	const [profesoradoId, setProfesoradoId] = useState<string>("");
+	const [planId, setPlanId] = useState<string>("");
+	const [materiaId, setMateriaId] = useState<string>("");
+	const [fecha, setFecha] = useState<string>(dayjs().format("YYYY-MM-DD"));
+	const [folio, setFolio] = useState<string>("");
+	const [libro, setLibro] = useState<string>("");
+	const [observaciones, setObservaciones] = useState<string>("");
+	const [docentes, setDocentes] = useState<DocenteState[]>(createEmptyDocentes);
+	const [estudiantes, setEstudiantes] = useState<EstudianteState[]>([
+		createEmptyEstudiante(1),
+	]);
+	const [oralActDrafts, setOralActDrafts] = useState<
+		Record<string, OralActFormValues>
+	>({});
+	const [oralDialogEstudiante, setOralDialogEstudiante] =
+		useState<EstudianteState | null>(null);
+	const [loadingEstudianteDni, setLoadingEstudianteDni] = useState<
+		string | null
+	>(null);
+	const [mesaCodigo, setMesaCodigo] = useState<string>("");
+	const [mesaBuscando, setMesaBuscando] = useState(false);
+	const [mesaBusquedaError, setMesaBusquedaError] = useState<string | null>(
+		null,
+	);
+	const [mesaSeleccionada, setMesaSeleccionada] =
+		useState<MesaResumenDTO | null>(null);
+	const [confirmActaOpen, setConfirmActaOpen] = useState(false);
+	const [pendingActaPayload, setPendingActaPayload] =
+		useState<ActaCreatePayload | null>(null);
+	const [isEditing] = useState(!!editId);
+	const [isInitialPopulated, setIsInitialPopulated] = useState(false);
+
+	const { data: actaParaEditar } = useQuery({
+		queryKey: ["acta-edicion", editId],
+		queryFn: () => obtenerActa(editId!),
+		enabled: !!editId,
+	});
+
+	const metadata = metadataQuery.data;
+	const notaOptions = metadata?.nota_opciones ?? [];
+
+	const profesorados = useMemo(() => {
+		const list = [...(metadata?.profesorados ?? [])];
+		if (editId && actaParaEditar && actaParaEditar.profesorado_id) {
+			const alreadyInMetadata = list.some(
+				(p) => String(p.id) === String(actaParaEditar.profesorado_id),
+			);
+			if (!alreadyInMetadata) {
+				list.push({
+					id: actaParaEditar.profesorado_id,
+					nombre: actaParaEditar.profesorado || "Cargando...",
+					planes: [
+						{
+							id: actaParaEditar.plan_id!,
+							resolucion: actaParaEditar.plan_resolucion || "Cargando...",
+							materias: [
+								{
+									id: actaParaEditar.materia_id!,
+									nombre: actaParaEditar.materia || "Cargando...",
+									anio_cursada: actaParaEditar.materia_anio || 1,
+									plan_id: actaParaEditar.plan_id!,
+									plan_resolucion: actaParaEditar.plan_resolucion || "",
+								},
+							],
+						},
+					],
+				});
+			}
+		}
+		const uniqueList: typeof list = [];
+		const seen = new Set();
+		list.forEach((p) => {
+			const sid = String(p.id);
+			if (!seen.has(sid)) {
+				seen.add(sid);
+				uniqueList.push(p);
+			}
+		});
+		return uniqueList;
+	}, [metadata, actaParaEditar, editId]);
+
+	const docentesDisponibles = metadata?.docentes ?? [];  
+
+	const docenteOptions = useMemo(
+		() =>
+			docentesDisponibles.map((doc) => {
+				const labelDni = doc.dni ?? "";
+				return labelDni ? `${labelDni} - ${doc.nombre}` : doc.nombre;
+			}),
+		[docentesDisponibles],
+	);
+
+	const selectedProfesorado = useMemo(
+		() => profesorados.find((p) => String(p.id) === profesoradoId),
+		[profesorados, profesoradoId],
+	);
+
+	const planesDisponibles = useMemo(() => {
+		const list = [...(selectedProfesorado?.planes ?? [])];
+		if (
+			editId &&
+			actaParaEditar &&
+			String(actaParaEditar.profesorado_id) === profesoradoId
+		) {
+			if (
+				actaParaEditar.plan_id &&
+				!list.some((p) => String(p.id) === String(actaParaEditar.plan_id))
+			) {
+				list.push({
+					id: actaParaEditar.plan_id,
+					resolucion: actaParaEditar.plan_resolucion || "Sin definir",
+					materias: [
+						{
+							id: actaParaEditar.materia_id!,
+							nombre: actaParaEditar.materia || "Sin definir",
+							anio_cursada: actaParaEditar.materia_anio || 1,
+							plan_id: actaParaEditar.plan_id!,
+							plan_resolucion: actaParaEditar.plan_resolucion || "",
+						},
+					],
+				});
+			}
+		}
+		return list;
+	}, [selectedProfesorado, editId, actaParaEditar, profesoradoId]);
+
+	const selectedPlan = useMemo(
+		() => planesDisponibles.find((p) => String(p.id) === planId),
+		[planesDisponibles, planId],
+	);
+
+	const materiasDisponibles = useMemo(() => {
+		const list = [...(selectedPlan?.materias ?? [])];
+		if (editId && actaParaEditar && String(actaParaEditar.plan_id) === planId) {
+			if (
+				actaParaEditar.materia_id &&
+				!list.some((m) => String(m.id) === String(actaParaEditar.materia_id))
+			) {
+				list.push({
+					id: actaParaEditar.materia_id,
+					nombre: actaParaEditar.materia || "Sin definir",
+					anio_cursada: actaParaEditar.materia_anio || 1,
+					plan_id: actaParaEditar.plan_id!,
+					plan_resolucion: actaParaEditar.plan_resolucion || "",
+				});
+			}
+		}
+		return list;
+	}, [selectedPlan, editId, actaParaEditar, planId]);
+
+	const selectedMateria = useMemo(
+		() => materiasDisponibles.find((m) => String(m.id) === materiaId),
+		[materiasDisponibles, materiaId],
+	);
+
+	useEffect(() => {
+		if (editId && actaParaEditar && !isInitialPopulated) {
+			if (actaParaEditar.tipo) setTipo(actaParaEditar.tipo as "REG" | "LIB");
+			if (actaParaEditar.profesorado_id)
+				setProfesoradoId(String(actaParaEditar.profesorado_id));
+			if (actaParaEditar.plan_id) setPlanId(String(actaParaEditar.plan_id));
+			if (actaParaEditar.materia_id)
+				setMateriaId(String(actaParaEditar.materia_id));
+			if (actaParaEditar.fecha) {
+				const parts = actaParaEditar.fecha.split("/");
+				setFecha(
+					parts.length === 3
+						? `${parts[2]}-${parts[1]}-${parts[0]}`
+						: actaParaEditar.fecha,
+				);
+			}
+			setFolio(actaParaEditar.folio || "");
+			setLibro(actaParaEditar.libro || "");
+			setObservaciones(actaParaEditar.observaciones || "");
+			if (metadata) {
+				if (actaParaEditar.docentes && actaParaEditar.docentes.length > 0) {
+										const loadedDocentes = actaParaEditar.docentes.map((d: any) => ({
+						rol: d.rol,
+						docente_id: Number(d.docente_id) || null,
+						nombre: d.nombre || "",
+						dni: d.dni || "",
+						inputValue: d.nombre || "",
+					}));
+					setDocentes(
+						createEmptyDocentes().map((emptyDoc) => {
+							const found = loadedDocentes.find(
+								(ld) => ld.rol === emptyDoc.rol,
+							);
+							return found || emptyDoc;
+						}),
+					);
+				}
+				if (
+					actaParaEditar.estudiantes &&
+					actaParaEditar.estudiantes.length > 0
+				) {
+					setEstudiantes(
+												actaParaEditar.estudiantes.map((e: any, index: number) => ({
+							internoId: `${index}-${Date.now()}`,
+							numero_orden: e.numero_orden || index + 1,
+							permiso_examen: e.permiso_examen || "",
+							dni: e.dni,
+							apellido_nombre: e.apellido_nombre,
+							examen_escrito: e.examen_escrito || "",
+							examen_oral: e.examen_oral || "",
+							calificacion_definitiva: e.calificacion_definitiva,
+							observaciones: e.observaciones || "",
+							// El acta no guarda la inscripción, pero el acta oral se
+							// persiste contra mesa+inscripción. Sin esto, al reabrir una
+							// mesa que ya tiene acta el acta oral no se guardaba y el
+							// estudiante nunca recibía el aviso de conformidad.
+							inscripcionId: estudiantesPreseleccionados?.find(
+								(p) => p.dni === e.dni,
+							)?.inscripcionId,
+						})),
+					);
+				}
+				setIsInitialPopulated(true);
+			}
+		}
+	}, [editId, actaParaEditar, metadata, isInitialPopulated, estudiantesPreseleccionados]);
+
+	// Auto-popular desde la mesa seleccionada en la planilla (modo integrado).
+	// Depende de metadata porque applyMesaSeleccionada necesita los IDs resueltos.
+	useEffect(() => {
+		if (!mesaPreseleccionada || editId || !metadata) return;
+		applyMesaSeleccionada(mesaPreseleccionada);
+		setMesaSeleccionada(mesaPreseleccionada);
+			}, [mesaPreseleccionada?.id, !!metadata]);
+
+	// Cuando la mesa ya tiene acta generada (editId), el efecto de arriba no
+	// corre (para no pisar los datos ya cargados del acta con los de la
+	// mesa). Pero handleOpenOralActa necesita mesaSeleccionada.id para poder
+	// buscar el acta oral guardada de cada estudiante — sin esto, "Ver" en
+	// mesas cerradas siempre abría el acta oral en blanco, como si nunca se
+	// hubiera cargado nada.
+	useEffect(() => {
+		if (!mesaPreseleccionada || !editId) return;
+		setMesaSeleccionada(mesaPreseleccionada);
+	}, [mesaPreseleccionada?.id, editId]);
+
+	// Auto-popular estudiantes desde la planilla (modo integrado)
+	useEffect(() => {
+		if (!estudiantesPreseleccionados || editId) return;
+		if (estudiantesPreseleccionados.length === 0) {
+			setEstudiantes([createEmptyEstudiante(1)]);
+			return;
+		}
+		setEstudiantes(
+			estudiantesPreseleccionados.map((e, index) => ({
+				...createEmptyEstudiante(index + 1),
+				dni: e.dni,
+				apellido_nombre: e.apellido_nombre,
+				inscripcionId: e.inscripcionId,
+			})),
+		);
+			}, [estudiantesPreseleccionados?.length, mesaPreseleccionada?.id]);
+
+	// --- Borrador local (localStorage) ---
+	// Red de seguridad para cargas largas (una mesa con muchos estudiantes
+	// puede tardar horas): si se corta la conexión o se cierra la pestaña
+	// antes de guardar, al volver a entrar a la misma mesa se recupera lo
+	// que ya se había completado. Solo aplica al flujo de mesa preseleccionada
+	// (docente/staff cargando una mesa puntual), no al alta libre ni a la
+	// edición de un acta ya generada (ahí el servidor ya es la fuente real).
+	const draftKey =
+		mesaPreseleccionada && !editId
+			? `acta-final-mesa-${mesaPreseleccionada.id}`
+			: null;
+	const draftRestauradoRef = useRef<string | null>(null);
+
+	useEffect(() => {
+		if (!draftKey || draftRestauradoRef.current === draftKey) return;
+		const draft = loadDraft<{
+			porDni: Record<
+				string,
+				Pick<
+					EstudianteState,
+					"calificacion_definitiva" | "examen_escrito" | "examen_oral" | "observaciones" | "permiso_examen"
+				>
+			>;
+			observaciones?: string;
+			folio?: string;
+			libro?: string;
+		}>(draftKey);
+		draftRestauradoRef.current = draftKey;
+		if (!draft) return;
+
+		let huboCambios = false;
+		setEstudiantes((prev) =>
+			prev.map((est) => {
+				const guardado = draft.porDni[est.dni];
+				if (!guardado) return est;
+				huboCambios = true;
+				return { ...est, ...guardado };
+			}),
+		);
+		if (draft.observaciones) setObservaciones(draft.observaciones);
+		if (draft.folio) setFolio(draft.folio);
+		if (draft.libro) setLibro(draft.libro);
+
+		if (huboCambios || draft.observaciones) {
+			enqueueSnackbar(
+				"Se recuperó un borrador guardado localmente de esta mesa (por un corte de conexión o cierre previo).",
+				{ variant: "info" },
+			);
+		}
+	}, [draftKey]);
+
+	// --- Borrador en servidor ("Guardar avance") ---
+	// A diferencia del localStorage de arriba (por navegador/PC), este
+	// borrador vive en la base de datos: si el docente cambia de mesa o de
+	// equipo, al volver a entrar lo recupera igual. Se pisa entre sí (uno
+	// por mesa) y se desactiva automáticamente cuando el acta se genera.
+	const [guardandoAvance, setGuardandoAvance] = useState(false);
+	const serverDraftCargadoRef = useRef<number | null>(null);
+
+	useEffect(() => {
+		const mesaId = mesaPreseleccionada?.id;
+		if (!mesaId || editId || serverDraftCargadoRef.current === mesaId) return;
+		serverDraftCargadoRef.current = mesaId;
+
+		obtenerBorradorActaFinal(mesaId)
+			.then((borrador) => {
+				if (borrador.folio) setFolio(borrador.folio);
+				if (borrador.libro) setLibro(borrador.libro);
+				if (borrador.observaciones) setObservaciones(borrador.observaciones);
+				if (borrador.estudiantes.length > 0) {
+					setEstudiantes((prev) => {
+						const porDni = new Map(
+							borrador.estudiantes.map((e) => [e.dni, e]),
+						);
+						return prev.map((est) => {
+							const guardado = porDni.get(est.dni);
+							if (!guardado) return est;
+							return {
+								...est,
+								permiso_examen: guardado.permiso_examen ?? est.permiso_examen,
+								examen_escrito: guardado.examen_escrito ?? est.examen_escrito,
+								examen_oral: guardado.examen_oral ?? est.examen_oral,
+								calificacion_definitiva:
+									guardado.calificacion_definitiva ?? est.calificacion_definitiva,
+								observaciones: guardado.observaciones ?? est.observaciones,
+							};
+						});
+					});
+				}
+				enqueueSnackbar(
+					"Se recuperó un avance guardado de esta mesa.",
+					{ variant: "info" },
+				);
+			})
+			.catch((error) => {
+				// 404 = no hay borrador guardado para esta mesa: es el caso normal y
+				// no se avisa nada. Un 403/500, en cambio, significa que puede haber
+				// un avance que no se pudo recuperar, y callarlo llevaría a recargar
+				// todo de cero creyendo que se perdió.
+				if (getErrorStatus(error) === 404) return;
+				enqueueSnackbar(
+					"No se pudo recuperar el avance guardado de esta mesa.",
+					{ variant: "error" },
+				);
+			});
+	}, [mesaPreseleccionada?.id, editId]);
+
+	const handleGuardarAvance = async () => {
+		const mesaId = mesaPreseleccionada?.id;
+		if (!mesaId || guardandoAvance) return;
+		setGuardandoAvance(true);
+		try {
+			await guardarBorradorActaFinal(mesaId, {
+				folio,
+				libro,
+				observaciones,
+				docentes: docentes
+					.filter((d) => d.nombre.trim())
+					.map((d) => ({
+						rol: d.rol,
+						docente_id: d.docente_id,
+						nombre: d.nombre,
+						dni: d.dni || null,
+					})),
+				estudiantes: estudiantes.map((e) => ({
+					numero_orden: e.numero_orden,
+					permiso_examen: e.permiso_examen || null,
+					dni: e.dni || null,
+					apellido_nombre: e.apellido_nombre || null,
+					examen_escrito: e.examen_escrito || null,
+					examen_oral: e.examen_oral || null,
+					calificacion_definitiva: e.calificacion_definitiva || null,
+					observaciones: e.observaciones || null,
+					inscripcion_id: e.inscripcionId ?? null,
+				})),
+			});
+			enqueueSnackbar("Avance guardado. Podés continuar más tarde.", {
+				variant: "success",
+			});
+		} catch {
+			enqueueSnackbar("No se pudo guardar el avance.", { variant: "error" });
+		} finally {
+			setGuardandoAvance(false);
+		}
+	};
+
+	useEffect(() => {
+		if (!draftKey) return;
+		const timer = setTimeout(() => {
+			const porDni: Record<string, unknown> = {};
+			for (const est of estudiantes) {
+				if (!est.dni) continue;
+				if (
+					!est.calificacion_definitiva &&
+					!est.examen_escrito &&
+					!est.examen_oral &&
+					!est.observaciones
+				) {
+					continue;
+				}
+				porDni[est.dni] = {
+					calificacion_definitiva: est.calificacion_definitiva,
+					examen_escrito: est.examen_escrito,
+					examen_oral: est.examen_oral,
+					observaciones: est.observaciones,
+					permiso_examen: est.permiso_examen,
+				};
+			}
+			if (Object.keys(porDni).length === 0) return;
+			saveDraft(draftKey, { porDni, observaciones, folio, libro });
+		}, 800);
+		return () => clearTimeout(timer);
+	}, [draftKey, estudiantes, observaciones, folio, libro]);
+
+	useEffect(() => {
+		if (editId && !isInitialPopulated) return;
+		if (!metadata) return;
+		if (
+			selectedPlan &&
+			!selectedPlan.materias.some((m) => String(m.id) === materiaId)
+		) {
+			setMateriaId("");
+		}
+	}, [selectedPlan, materiaId, editId, isInitialPopulated, metadata]);
+
+	useEffect(() => {
+		if (editId && !isInitialPopulated) return;
+		if (!metadata) return;
+		if (
+			selectedProfesorado &&
+			!selectedProfesorado.planes.some((p) => String(p.id) === planId)
+		) {
+			setPlanId("");
+			setMateriaId("");
+		}
+	}, [selectedProfesorado, planId, editId, isInitialPopulated, metadata]);
+
+	const summary = useMemo(() => {
+		const total = estudiantes.length;
+		let aprobados = 0;
+		let desaprobados = 0;
+		let ausentes = 0;
+		estudiantes.forEach((estudiante) => {
+			const categoria = clasificarNota(estudiante.calificacion_definitiva);
+			if (categoria === "aprobado") aprobados += 1;
+			if (categoria === "desaprobado") desaprobados += 1;
+			if (categoria === "ausente") ausentes += 1;
+		});
+		return { total, aprobados, desaprobados, ausentes };
+	}, [estudiantes]);
+
+	const tribunalInfo = useMemo(
+		() => ({
+			presidente: docentes.find((doc) => doc.rol === "PRES")?.nombre ?? "",
+			vocal1: docentes.find((doc) => doc.rol === "VOC1")?.nombre ?? "",
+			vocal2: docentes.find((doc) => doc.rol === "VOC2")?.nombre ?? "",
+		}),
+		[docentes],
+	);
+
+	const confirmActaContext = pendingActaPayload
+		? `acta de examen de ${selectedMateria?.nombre ?? "la mesa seleccionada"}`
+		: "acta de examen final";
+
+	const mutation = useMutation({
+		mutationFn: (payload: ActaCreatePayload) => crearActaExamen(payload),
+		onSuccess: (response) => {
+			queryClient.invalidateQueries({ queryKey: ["acta-examen-metadata"] });
+			enqueueSnackbar(response.message || successMessage, {
+				variant: "success",
+			});
+
+			if (draftKey) clearDraft(draftKey);
+			setDocentes(createEmptyDocentes());
+			setEstudiantes([createEmptyEstudiante(1)]);
+			setFolio("");
+			setLibro("");
+			setObservaciones("");
+			setPendingActaPayload(null);
+			setConfirmActaOpen(false);
+		},
+				onError: (error: any) => {
+			enqueueSnackbar(
+				error?.response?.data?.message || "No se pudo generar el acta.",
+				{ variant: "error" },
+			);
+		},
+	});
+
+	const { mutate: updateMutation, isPending: isUpdating } = useMutation({
+		mutationFn: (payload: ActaCreatePayload) =>
+			actualizarActaExamen(editId!, payload),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["acta-examen-metadata"] });
+			enqueueSnackbar(successMessage || "Acta actualizada correctamente.", {
+				variant: "success",
+			});
+			setConfirmActaOpen(false);
+		},
+				onError: (error: any) => {
+			enqueueSnackbar(
+				error?.response?.data?.message || "No se pudo actualizar el acta.",
+				{ variant: "error" },
+			);
+		},
+	});
+
+	const isCreating = mutation.isPending;
+	const isSaving = isCreating || isUpdating;
+
+	const updateEstudiante = (
+		internoId: string,
+		patch: Partial<EstudianteState>,
+	) => {
+		setEstudiantes((prev) =>
+			prev.map((item) =>
+				item.internoId === internoId ? { ...item, ...patch } : item,
+			),
+		);
+	};
+
+	const updateDocente = (index: number, patch: Partial<DocenteState>) => {
+		setDocentes((prev) =>
+			prev.map((doc, idx) => (idx === index ? { ...doc, ...patch } : doc)),
+		);
+	};
+
+	const applyMesaSeleccionada = (mesa: MesaResumenDTO) => {
+		if (mesa.profesorado_id) setProfesoradoId(String(mesa.profesorado_id));
+		if (mesa.plan_id) setPlanId(String(mesa.plan_id));
+		if (mesa.materia_id) setMateriaId(String(mesa.materia_id));
+		if (mesa.fecha) {
+			// Acepta tanto "DD/MM/YYYY" (backend management) como "YYYY-MM-DD" (ISO)
+			const parsed = mesa.fecha.includes("/")
+				? dayjs(mesa.fecha, "DD/MM/YYYY")
+				: dayjs(mesa.fecha);
+			if (parsed.isValid()) setFecha(parsed.format("YYYY-MM-DD"));
+		}
+		if (mesa.modalidad === "LIB") setTipo("LIB");
+		else if (mesa.modalidad === "REG") setTipo("REG");
+		if (mesa.docentes && mesa.docentes.length) {
+			// Normaliza roles: "Presidente"→"PRES", "Vocal 1"→"VOC1", "Vocal 2"→"VOC2"
+			const ROL_MAP: Record<string, string> = {
+				Presidente: "PRES",
+				PRES: "PRES",
+				"Vocal 1": "VOC1",
+				VOC1: "VOC1",
+				"Vocal 2": "VOC2",
+				VOC2: "VOC2",
+			};
+			setDocentes((prev) =>
+				prev.map((doc) => {
+					const remoto = mesa.docentes?.find(
+						(item) => (ROL_MAP[item.rol] ?? item.rol) === doc.rol,
+					);
+					if (!remoto) return doc;
+					return {
+						...doc,
+						docente_id: remoto.docente_id ?? null,
+						nombre: remoto.nombre ?? "",
+						dni: remoto.dni ?? "",
+						inputValue: remoto.nombre ?? "",
+					};
+				}),
+			);
+		}
+	};
+
+	const handleBuscarMesa = async () => {
+		const code = mesaCodigo.trim();
+		if (!code) {
+			setMesaBusquedaError("Ingresá un código de mesa.");
+			setMesaSeleccionada(null);
+			return;
+		}
+		setMesaBuscando(true);
+		setMesaBusquedaError(null);
+		try {
+			const encontrada = await buscarMesaPorCodigo(code);
+			if (!encontrada) {
+				setMesaSeleccionada(null);
+				setMesaBusquedaError("No se encontró una mesa con ese código.");
+				return;
+			}
+			setMesaSeleccionada(encontrada);
+			applyMesaSeleccionada(encontrada);
+		} catch (_error) {
+			void 0;
+			setMesaBusquedaError("No se pudo buscar la mesa. Intenta nuevamente.");
+		} finally {
+			setMesaBuscando(false);
+		}
+	};
+
+	const handleAgregarEstudiante = () => {
+		setEstudiantes((prev) => [...prev, createEmptyEstudiante(prev.length + 1)]);
+	};
+
+	const handleEliminarEstudiante = (internoId: string) => {
+		setEstudiantes((prev) => {
+			const filtered = prev.filter((item) => item.internoId !== internoId);
+			return filtered.map((item, index) => ({
+				...item,
+				numero_orden: index + 1,
+			}));
+		});
+	};
+
+	const handleEstudianteDniChange = async (internoId: string, dni: string) => {
+		const numeric = dni.replace(/\D/g, "").slice(0, 10);
+		updateEstudiante(internoId, { dni: numeric, apellido_nombre: "" });
+		if (numeric.length < 8) return;
+		try {
+			setLoadingEstudianteDni(internoId);
+			const data = await fetchEstudianteAdminDetail(numeric);
+			setEstudiantes((prev) =>
+				prev.map((item) =>
+					item.internoId === internoId && item.dni === numeric
+						? { ...item, apellido_nombre: `${data.apellido}, ${data.nombre}` }
+						: item,
+				),
+			);
+					} catch (error: any) {
+			if (strict) {
+				enqueueSnackbar(
+					error?.response?.data?.message ||
+						"No se encontró un estudiante con ese DNI.",
+					{ variant: "error" },
+				);
+			} else {
+				void 0;
+			}
+		} finally {
+			setLoadingEstudianteDni((current) =>
+				current === internoId ? null : current,
+			);
+		}
+	};
+
+	const handleOpenOralActa = async (estudiante: EstudianteState) => {
+		setOralDialogEstudiante(estudiante);
+
+		// Los borradores viven en memoria, así que al recargar la página el acta
+		// ya cargada aparecía en blanco, como si se hubiera perdido lo enviado al
+		// estudiante. Se recupera la que está guardada en el servidor.
+		const mesaId = mesaSeleccionada?.id;
+		const inscripcionId = estudiante.inscripcionId;
+		if (!mesaId || !inscripcionId) return;
+
+		try {
+			const acta = await obtenerActaOral(mesaId, inscripcionId);
+			if (!acta) return;
+			const toRows = (temas: { tema: string; score?: string | null }[]) =>
+				temas.map((t, i) => ({
+					id: `${i}-${t.tema}`,
+					tema: t.tema,
+					score: (t.score || "") as OralActFormValues["temasEstudiante"][number]["score"],
+				}));
+			setOralActDrafts((prev) => ({
+				...prev,
+				[estudiante.internoId]: {
+					actaNumero: acta.acta_numero || "",
+					folioNumero: acta.folio_numero || "",
+					fecha: acta.fecha || fecha,
+					curso: acta.curso || "",
+					notaFinal: acta.nota_final || "",
+					observaciones: acta.observaciones || "",
+					temasEstudiante: toRows(acta.temas_estudiante || []),
+					temasDocente: toRows(acta.temas_docente || []),
+				},
+			}));
+		} catch (error) {
+			// 404 = todavía no hay acta oral cargada para este estudiante: se abre
+			// vacía. Cualquier otro error (permisos, servidor) se avisa, para no
+			// confundir "no hay acta" con "no se pudo traer la acta que sí existe".
+			// El interceptor de client.ts no propaga el AxiosError sino un AppError,
+			// así que el status hay que leerlo de ahí: mirando isAxiosError, el 404
+			// normal de "todavía sin acta" caía en el else y mostraba el cartel rojo.
+			if (getErrorStatus(error) !== 404) {
+				enqueueSnackbar(
+					"No se pudo cargar el acta oral guardada de este estudiante.",
+					{ variant: "error" },
+				);
+			}
+		}
+	};
+
+	const handleSaveOralActa = async (values: OralActFormValues) => {
+		if (!oralDialogEstudiante) return;
+		setOralActDrafts((prev) => ({
+			...prev,
+			[oralDialogEstudiante.internoId]: values,
+		}));
+
+		const mesaId = mesaSeleccionada?.id;
+		const inscripcionId = oralDialogEstudiante.inscripcionId;
+
+		// Sin mesa (carga manual de un acta suelta) no hay contra qué persistir:
+		// el borrador queda solo en memoria del formulario.
+		if (!mesaId) return;
+
+		// Con mesa pero sin inscripción hay un problema de datos, no un modo de uso.
+		// Antes se salía en silencio: el acta no se guardaba y el estudiante nunca
+		// recibía el aviso, sin ninguna señal de que algo falló.
+		if (!inscripcionId) {
+			enqueueSnackbar(
+				"No se pudo vincular al estudiante con su inscripción a la mesa, " +
+					"así que el acta oral no quedó guardada ni se le envió para su conformidad. " +
+					"Volvé a abrir la planilla de la mesa e intentá de nuevo.",
+				{ variant: "error" },
+			);
+			return;
+		}
+
+		// Con mesa e inscripción, el acta oral se persiste en el sistema. La
+		// impresión del PDF la hace Secretaría después, desde su propio flujo.
+		const mapTemas = (temas: OralActFormValues["temasEstudiante"]) =>
+			temas
+				.filter((t) => t.tema.trim())
+				.map((t) => ({ tema: t.tema.trim(), score: t.score || null }));
+
+		try {
+			await guardarActaOral(mesaId, inscripcionId, {
+				acta_numero: values.actaNumero || null,
+				folio_numero: values.folioNumero || null,
+				fecha: values.fecha || null,
+				curso: values.curso || null,
+				nota_final: values.notaFinal || null,
+				observaciones: values.observaciones || null,
+				temas_estudiante: mapTemas(values.temasEstudiante),
+				temas_docente: mapTemas(values.temasDocente),
+			});
+		} catch (error: any) {
+			enqueueSnackbar(
+				error?.response?.data?.message ||
+					"No se pudo guardar el acta oral. Verificá que seas el docente titular de la mesa.",
+				{ variant: "error" },
+			);
+			throw error;
+		}
+	};
+
+	const handleDocenteInputChange = (index: number, rawValue: string) => {
+		const value = rawValue;
+		const trimmed = value.trim();
+		if (!trimmed) {
+			updateDocente(index, {
+				docente_id: null,
+				dni: "",
+				nombre: "",
+				inputValue: "",
+			});
+			return;
+		}
+
+		const exactMatch = docentesDisponibles.find((doc) => {
+			const label = doc.dni ? `${doc.dni} - ${doc.nombre}` : doc.nombre;
+			return label === value;
+		});
+		if (exactMatch) {
+			updateDocente(index, {
+				docente_id: exactMatch.id,
+				dni: exactMatch.dni || "",
+				nombre: exactMatch.nombre,
+				inputValue: value,
+			});
+			return;
+		}
+
+		const normalized = trimmed.replace(/\s+/g, " ");
+		const hyphenIndex = normalized.indexOf("-");
+		const dniSegmentRaw =
+			hyphenIndex >= 0 ? normalized.slice(0, hyphenIndex).trim() : normalized;
+		const isHist = dniSegmentRaw.toUpperCase().startsWith("HIST-");
+		const sanitizedDni = isHist
+			? dniSegmentRaw
+			: dniSegmentRaw.replace(/\D/g, "");
+
+		if (!isHist && (sanitizedDni.length < 6 || sanitizedDni.length > 9)) {
+			if (hyphenIndex === -1 && sanitizedDni.length === 0) {
+				updateDocente(index, {
+					docente_id: null,
+					dni: "",
+					nombre: normalized,
+					inputValue: value,
+				});
+				return;
+			}
+			if (sanitizedDni.length !== 8 && sanitizedDni.length !== 7) {
+				const nombreOnly =
+					hyphenIndex >= 0
+						? normalized.slice(hyphenIndex + 1).trim()
+						: normalized;
+				updateDocente(index, {
+					docente_id: null,
+					dni: sanitizedDni,
+					nombre: nombreOnly,
+					inputValue: value,
+				});
+				return;
+			}
+		}
+
+		const match = docentesDisponibles.find((doc) => {
+			const candidateDni = doc.dni
+				? doc.dni.toUpperCase().startsWith("HIST-")
+					? doc.dni
+					: doc.dni.replace(/\D/g, "")
+				: null;
+			return candidateDni === sanitizedDni;
+		});
+		if (match) {
+			const formattedDni = match.dni ?? sanitizedDni;
+			updateDocente(index, {
+				docente_id: match.id,
+				dni: sanitizedDni,
+				nombre: match.nombre,
+				inputValue: `${formattedDni} - ${match.nombre}`,
+			});
+			return;
+		}
+
+		const nombreFromInput =
+			hyphenIndex >= 0 ? normalized.slice(hyphenIndex + 1).trim() : "";
+		const displayValue = nombreFromInput
+			? `${dniSegmentRaw || sanitizedDni} - ${nombreFromInput}`
+			: value;
+		updateDocente(index, {
+			docente_id: null,
+			dni: sanitizedDni,
+			nombre: nombreFromInput,
+			inputValue: displayValue,
+		});
+	};
+
+	const handleSubmit = () => {
+		if (!profesoradoId || !planId || !materiaId) {
+			enqueueSnackbar("Seleccione profesorado, plan y materia.", {
+				variant: "warning",
+			});
+			return;
+		}
+		// Folio y libro vacíos significan carga digital: el backend le asigna el
+		// libro SIGI y el folio correlativo al guardar el acta definitiva. Solo se
+		// exige el folio si se está registrando un acta en papel (libro cargado).
+		if (libro.trim() && !folio.trim()) {
+			enqueueSnackbar("Ingrese el número de folio del acta.", {
+				variant: "warning",
+			});
+			return;
+		}
+		if (estudiantes.some((estudiante) => !estudiante.calificacion_definitiva)) {
+			enqueueSnackbar(
+				"Complete la calificación definitiva en todas las filas.",
+				{ variant: "warning" },
+			);
+			return;
+		}
+		if (strict && summary.total === 0) {
+			enqueueSnackbar("Debe agregar al menos un estudiante al acta.", {
+				variant: "warning",
+			});
+			return;
+		}
+
+		const docentesPayload = docentes.map((doc) => ({
+			rol: doc.rol,
+			docente_id: doc.docente_id ?? null,
+			nombre: doc.nombre.trim(),
+			dni: doc.dni?.trim() || null,
+		}));
+		const estudiantesPayload: ActaEstudiantePayload[] = estudiantes.map(
+			(estudiante, index) => ({
+				numero_orden: index + 1,
+				permiso_examen: estudiante.permiso_examen?.trim() || undefined,
+				dni: estudiante.dni.trim(),
+				apellido_nombre: estudiante.apellido_nombre.trim(),
+				examen_escrito: estudiante.examen_escrito || undefined,
+				examen_oral: estudiante.examen_oral || undefined,
+				calificacion_definitiva: estudiante.calificacion_definitiva,
+				observaciones: estudiante.observaciones?.trim() || undefined,
+			}),
+		);
+		const payload: ActaCreatePayload = {
+			tipo,
+			profesorado_id: Number(profesoradoId),
+			materia_id: Number(materiaId),
+			fecha,
+			folio: folio.trim() || undefined,
+			libro: libro.trim() || undefined,
+			observaciones: observaciones.trim() || undefined,
+			docentes: docentesPayload,
+			estudiantes: estudiantesPayload,
+			total_aprobados: summary.aprobados,
+			total_desaprobados: summary.desaprobados,
+			total_ausentes: summary.ausentes,
+			strict,
+			// Sin esto el backend busca la mesa por materia+fecha+modalidad, y cuando
+			// hay más de una mesa de la misma materia el mismo día (dos turnos)
+			// elegía cualquiera: el acta terminaba colgada de la mesa equivocada.
+			mesa_id: mesaSeleccionada?.id,
+		};
+
+		setPendingActaPayload(payload);
+		setConfirmActaOpen(true);
+	};
+
+	const handleConfirmActaSubmit = () => {
+		if (!pendingActaPayload) return;
+		if (isEditing) updateMutation(pendingActaPayload);
+		else mutation.mutate(pendingActaPayload);
+	};
+
+	const handleCancelActaSubmit = () => {
+		if (mutation.isPending) return;
+		setConfirmActaOpen(false);
+		setPendingActaPayload(null);
+	};
+
+	return {
+		// borrador de servidor
+		guardandoAvance,
+		handleGuardarAvance,
+		// metadata
+		metadataQuery,
+		metadata,
+		notaOptions,
+		// form fields
+		tipo,
+		setTipo,
+		profesoradoId,
+		setProfesoradoId,
+		setPlanId,
+		setMateriaId,
+		planId,
+		setPlanId2: setPlanId,
+		materiaId,
+		fecha,
+		setFecha,
+		folio,
+		setFolio,
+		libro,
+		setLibro,
+		observaciones,
+		setObservaciones,
+		// derived
+		profesorados,
+		selectedProfesorado,
+		planesDisponibles,
+		selectedPlan,
+		materiasDisponibles,
+		selectedMateria,
+		// docentes
+		docentes,
+		docenteOptions,
+		handleDocenteInputChange,
+		// estudiantes
+		estudiantes,
+		loadingEstudianteDni,
+		summary,
+		handleAgregarEstudiante,
+		handleEliminarEstudiante,
+		handleEstudianteDniChange,
+		updateEstudiante,
+		// oral
+		oralActDrafts,
+		oralDialogEstudiante,
+		setOralDialogEstudiante,
+		handleOpenOralActa,
+		handleSaveOralActa,
+		// mesa
+		mesaCodigo,
+		setMesaCodigo,
+		mesaBuscando,
+		mesaBusquedaError,
+		mesaSeleccionada,
+		handleBuscarMesa,
+		// confirm
+		confirmActaOpen,
+		pendingActaPayload,
+		confirmActaContext,
+		handleSubmit,
+		handleConfirmActaSubmit,
+		handleCancelActaSubmit,
+		// status
+		isEditing,
+		isSaving,
+		tribunalInfo,
+	};
+}

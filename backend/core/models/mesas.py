@@ -1,0 +1,370 @@
+from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
+from django.core.validators import MaxValueValidator, MinValueValidator
+from django.db import models
+from django.utils import timezone
+
+from .base import Docente
+from .carreras import Materia
+from .estudiantes import Estudiante
+from .horarios import VentanaHabilitacion
+
+
+class MesaExamen(models.Model):
+    class Tipo(models.TextChoices):
+        FINAL = "FIN", "Ordinaria"
+        EXTRAORDINARIA = "EXT", "Extraordinaria"
+        ESPECIAL = "ESP", "Especial"
+
+    class Modalidad(models.TextChoices):
+        REGULAR = "REG", "Regular"
+        LIBRE = "LIB", "Libre"
+
+    materia = models.ForeignKey(Materia, on_delete=models.CASCADE, related_name="mesas")
+    tipo = models.CharField(max_length=3, choices=Tipo.choices)
+    modalidad = models.CharField(max_length=3, choices=Modalidad.choices, default=Modalidad.REGULAR)
+    fecha = models.DateField()
+    hora_desde = models.TimeField(null=True, blank=True)
+    hora_hasta = models.TimeField(null=True, blank=True)
+    numero_mesa = models.PositiveIntegerField(null=True, blank=True)
+    aula = models.CharField(max_length=64, blank=True, null=True)
+    cupo = models.IntegerField(default=0)
+    ventana = models.ForeignKey(VentanaHabilitacion, on_delete=models.SET_NULL, null=True, blank=True)
+    codigo = models.CharField(max_length=128, unique=True, blank=True, null=True)
+    docente_presidente = models.ForeignKey(
+        Docente,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="mesas_como_presidente",
+    )
+    docente_vocal1 = models.ForeignKey(
+        Docente,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="mesas_como_vocal1",
+    )
+    docente_vocal2 = models.ForeignKey(
+        Docente,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="mesas_como_vocal2",
+    )
+    estudiante_exclusivo = models.ForeignKey(
+        Estudiante,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="mesas_exclusivas",
+        help_text="Solo para mesas ESP: el estudiante para quien fue creada.",
+    )
+    activa = models.BooleanField(
+        default=True,
+        help_text="False cuando la mesa fue descartada administrativamente (soft-delete).",
+    )
+    planilla_cerrada_en = models.DateTimeField(null=True, blank=True)
+    planilla_cerrada_por = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="mesas_planillas_cerradas",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    @staticmethod
+    def auto_cleanup_deserted_mesas(dias_gracia: int = 5):
+        """
+        Desactiva (soft-delete) mesas sin inscriptos activos que superaron el período de gracia.
+
+        Criterio:
+        - Si la mesa tiene ventana: se desactiva si pasaron `dias_gracia` días del cierre de la ventana.
+        - Si no tiene ventana (mesa especial): se desactiva si pasaron `dias_gracia` días de la fecha del examen.
+
+        Usa soft-delete (activa=False) para preservar el historial de inscripciones
+        canceladas y no destruir trazabilidad administrativa.
+        """
+        from datetime import date, timedelta
+
+        from django.db.models import Count, Q
+
+        hoy = date.today()
+
+        mesas_candidatas = (
+            MesaExamen.objects.select_related("ventana")
+            .filter(
+                fecha__lt=hoy,
+                activa=True,
+            )
+            .annotate(count_inscriptos=Count("inscripciones", filter=Q(inscripciones__estado="INS")))
+            .filter(count_inscriptos=0)
+        )
+
+        deactivated_count = 0
+        for mesa in mesas_candidatas:
+            if mesa.ventana:
+                fecha_limite = mesa.ventana.hasta + timedelta(days=dias_gracia)
+            else:
+                fecha_limite = mesa.fecha + timedelta(days=dias_gracia)
+
+            if hoy > fecha_limite:
+                type(mesa).objects.filter(pk=mesa.pk).update(activa=False)
+                deactivated_count += 1
+
+        return deactivated_count
+
+    class Meta:
+        constraints = [
+            # No puede haber dos mesas iguales el mismo día. La materia ya
+            # pertenece a un plan de un profesorado, así que materia_id alcanza
+            # para distinguir "Pedagogía de Primaria" de "Pedagogía de Inicial".
+            #
+            # La modalidad forma parte de la clave a propósito: una mesa regular
+            # y una libre de la misma materia el mismo día son legítimas y
+            # frecuentes (92 casos en los datos). Los llamados 1° y 2° siempre
+            # caen en fechas distintas, así que tampoco chocan.
+            models.UniqueConstraint(
+                fields=["materia", "fecha", "modalidad"],
+                name="mesa_unica_por_materia_fecha_modalidad",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Mesa {self.get_tipo_display()} {self.materia.nombre} {self.fecha}"
+
+    def _build_codigo(self) -> str:
+        fecha_ref = self.fecha or timezone.now().date()
+        return f"MESA-{fecha_ref.strftime('%Y%m%d')}-{self.id:05d}"
+
+    def save(self, *args, **kwargs):
+        was_blank_codigo = not self.codigo
+        super().save(*args, **kwargs)
+        if self.codigo and not was_blank_codigo:
+            return
+        if not self.codigo:
+            codigo = self._build_codigo()
+            type(self).objects.filter(pk=self.pk).update(codigo=codigo)
+            self.codigo = codigo
+
+
+class InscripcionMesa(models.Model):
+    class Estado(models.TextChoices):
+        INSCRIPTO = "INS", "Inscripto"
+        CANCELADO = "CAN", "Cancelado"
+
+    class Condicion(models.TextChoices):
+        APROBADO = "APR", "Aprobado"
+        DESAPROBADO = "DES", "Desaprobado"
+        AUSENTE = "AUS", "Ausente"
+        AUSENTE_JUSTIFICADO = "AUJ", "Ausente justificado"
+
+    mesa = models.ForeignKey(MesaExamen, on_delete=models.CASCADE, related_name="inscripciones")
+    estudiante = models.ForeignKey(Estudiante, on_delete=models.CASCADE, related_name="inscripciones_mesa")
+    estado = models.CharField(max_length=3, choices=Estado.choices, default=Estado.INSCRIPTO)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    fecha_resultado = models.DateField(null=True, blank=True)
+    condicion = models.CharField(max_length=3, choices=Condicion.choices, null=True, blank=True)
+    nota = models.PositiveSmallIntegerField(
+        null=True, blank=True, validators=[MinValueValidator(1), MaxValueValidator(10)]
+    )
+    folio = models.CharField(max_length=32, null=True, blank=True)
+    libro = models.CharField(max_length=32, null=True, blank=True)
+    observaciones = models.TextField(null=True, blank=True)
+    cuenta_para_intentos = models.BooleanField(default=True)
+
+    def clean(self):
+        super().clean()
+        if self.condicion in [self.Condicion.APROBADO, self.Condicion.DESAPROBADO] and self.nota is None:
+            raise ValidationError(f"Debe ingresar una nota para un examen {self.get_condicion_display()}.")
+        if self.condicion in [self.Condicion.AUSENTE, self.Condicion.AUSENTE_JUSTIFICADO] and self.nota is not None:
+            raise ValidationError("No se puede ingresar una nota para un estudiante ausente.")
+
+    class Meta:
+        unique_together = ("mesa", "estudiante")
+
+
+class MesaActaOral(models.Model):
+    class EstadoConformidad(models.TextChoices):
+        PENDIENTE = "PEN", "Pendiente de notificación"
+        CONFORME = "CON", "Notificado y sin objeción"
+        DISCONFORME = "DIS", "Notificado y en disconformidad"
+        TIMEOUT = "TIM", "Notificado y sin objeción (por tiempo cumplido)"
+
+    mesa = models.ForeignKey(MesaExamen, on_delete=models.CASCADE, related_name="actas_orales")
+    inscripcion = models.OneToOneField(InscripcionMesa, on_delete=models.CASCADE, related_name="acta_oral")
+    acta_numero = models.CharField(max_length=64, blank=True, default="")
+    folio_numero = models.CharField(max_length=64, blank=True, default="")
+    fecha = models.DateField(null=True, blank=True)
+    curso = models.CharField(max_length=128, blank=True, default="")
+    nota_final = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="Transcripción literal de la nota o estado (ej: 'Siete', 'Ausente')",
+    )
+    nota_numeral = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(10)],
+        help_text="Valor numérico para promedios y estadísticas",
+    )
+    observaciones = models.TextField(blank=True, default="")
+    temas_alumno = models.JSONField(default=list, blank=True)
+    temas_docente = models.JSONField(default=list, blank=True)
+    estado_conformidad = models.CharField(
+        max_length=3,
+        choices=EstadoConformidad.choices,
+        default=EstadoConformidad.PENDIENTE,
+        db_index=True,
+        help_text="Estado de la notificación y conformidad del estudiante",
+    )
+    notificado_en = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Momento en que el docente guardó la nota del acta oral y se inició la ventana de 10 min",
+    )
+    respondido_en = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Momento en que el estudiante respondió o se cerró automáticamente por timeout",
+    )
+    observaciones_estudiante = models.TextField(
+        blank=True,
+        default="",
+        help_text="Observación opcional del estudiante al manifestar disconformidad",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Acta de examen oral"
+        verbose_name_plural = "Actas de examen oral"
+
+    def clean(self):
+        if self.nota_final:
+            import re
+
+            # Validar que si contiene números, estos sean coherentes
+            numeros = re.findall(r"\d+", self.nota_final)
+            if numeros:
+                # Opcional: validar que el primer número esté entre 1 y 10
+                nota_num = int(numeros[0])
+                if nota_num < 1 or nota_num > 10:
+                    raise ValidationError(
+                        f"La nota '{nota_num}' extraída de '{self.nota_final}' no es válida (debe ser de 1 a 10)."
+                    )
+
+    def __str__(self):
+        return f"Acta oral {self.acta_numero or self.inscripcion_id}"
+
+
+class BorradorActaFinal(models.Model):
+    """
+    Avance provisorio de un acta final antes de generarla/cerrarla.
+
+    No es la fuente de verdad (eso sigue siendo ActaExamen/InscripcionMesa):
+    es una red de seguridad para que un docente pueda guardar lo que va
+    tipeando, cambiar de mesa o de PC, y retomarlo después sin perder nada.
+    Un solo borrador activo por mesa (se pisa con cada "Guardar avance").
+
+    Deliberadamente sin JSONField: los datos con forma de lista (la fila por
+    estudiante) se guardan como texto plano delimitado en `estudiantes_csv`,
+    una línea por estudiante con el formato:
+        dni|apellido_nombre|numero_orden|permiso_examen|examen_escrito|
+        examen_oral|calificacion_definitiva|observaciones|inscripcion_id
+    """
+
+    mesa = models.OneToOneField(MesaExamen, on_delete=models.CASCADE, related_name="borrador_acta_final")
+    folio = models.CharField(max_length=32, blank=True, default="")
+    libro = models.CharField(max_length=32, blank=True, default="")
+    observaciones_generales = models.TextField(blank=True, default="")
+    docente_presidente_nombre = models.CharField(max_length=255, blank=True, default="")
+    docente_presidente_dni = models.CharField(max_length=16, blank=True, default="")
+    docente_vocal1_nombre = models.CharField(max_length=255, blank=True, default="")
+    docente_vocal1_dni = models.CharField(max_length=16, blank=True, default="")
+    docente_vocal2_nombre = models.CharField(max_length=255, blank=True, default="")
+    docente_vocal2_dni = models.CharField(max_length=16, blank=True, default="")
+    estudiantes_csv = models.TextField(blank=True, default="")
+    activo = models.BooleanField(
+        default=True,
+        help_text="False cuando el acta final se generó/cerró y este borrador queda obsoleto.",
+    )
+    guardado_por = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="borradores_acta_final"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Borrador de acta final"
+        verbose_name_plural = "Borradores de acta final"
+
+    def __str__(self):
+        return f"Borrador acta final mesa {self.mesa_id} ({'activo' if self.activo else 'inactivo'})"
+
+
+class BorradorActaOral(models.Model):
+    """
+    Avance provisorio de un acta oral individual antes de generarla.
+
+    Mismo criterio que BorradorActaFinal: red de seguridad, no fuente de
+    verdad, sin JSONField. Los temas (lista variable) se guardan como texto
+    plano delimitado, una línea "tema|puntaje" por fila.
+    """
+
+    inscripcion = models.OneToOneField(InscripcionMesa, on_delete=models.CASCADE, related_name="borrador_acta_oral")
+    mesa = models.ForeignKey(MesaExamen, on_delete=models.CASCADE, related_name="borradores_acta_oral")
+    acta_numero = models.CharField(max_length=64, blank=True, default="")
+    folio_numero = models.CharField(max_length=64, blank=True, default="")
+    fecha = models.CharField(max_length=16, blank=True, default="")
+    curso = models.CharField(max_length=128, blank=True, default="")
+    nota_final = models.CharField(max_length=32, blank=True, default="")
+    observaciones = models.TextField(blank=True, default="")
+    temas_alumno_csv = models.TextField(blank=True, default="")
+    temas_docente_csv = models.TextField(blank=True, default="")
+    activo = models.BooleanField(
+        default=True,
+        help_text="False cuando el acta oral se generó y este borrador queda obsoleto.",
+    )
+    guardado_por = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="borradores_acta_oral"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Borrador de acta oral"
+        verbose_name_plural = "Borradores de acta oral"
+
+    def __str__(self):
+        return f"Borrador acta oral insc {self.inscripcion_id} ({'activo' if self.activo else 'inactivo'})"
+
+
+class SolicitudMesa(models.Model):
+    class Estado(models.TextChoices):
+        PENDIENTE = "PEN", "Pendiente"
+        PROCESADA = "PRO", "Mesa Aprobada"
+        RECHAZADA = "REC", "Rechazada"
+
+    estudiante = models.ForeignKey(Estudiante, on_delete=models.CASCADE, related_name="solicitudes_mesa")
+    materia = models.ForeignKey(Materia, on_delete=models.CASCADE)
+    ventana = models.ForeignKey(VentanaHabilitacion, on_delete=models.CASCADE)
+    fecha_solicitud = models.DateTimeField(auto_now_add=True)
+    modalidad = models.CharField(
+        max_length=3, choices=MesaExamen.Modalidad.choices, default=MesaExamen.Modalidad.REGULAR
+    )
+    observaciones = models.TextField(blank=True, null=True)
+    estado = models.CharField(max_length=3, choices=Estado.choices, default=Estado.PENDIENTE)
+    mesa_asignada = models.ForeignKey("MesaExamen", on_delete=models.SET_NULL, null=True, blank=True)
+
+    class Meta:
+        unique_together = ("estudiante", "materia", "ventana")
+        verbose_name = "Solicitud de mesa"
+        verbose_name_plural = "Solicitudes de mesa"
+
+    def __str__(self):
+        return f"Solicitud {self.materia.nombre} - {self.estudiante.persona.dni} ({self.get_estado_display()})"

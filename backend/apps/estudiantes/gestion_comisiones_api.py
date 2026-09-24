@@ -1,0 +1,228 @@
+import random
+from typing import List, Optional
+
+from django.db import transaction
+from django.db.models import Count, Q
+from django.shortcuts import get_object_or_404
+from ninja import Router, Schema
+
+from apps.common.api_schemas import ApiResponse
+from core.auth_ninja import JWTAuth
+from core.models import Comision, Estudiante, InscripcionMateriaEstudiante, Materia, PlanDeEstudio, Turno
+from core.permissions import ensure_profesorado_access, requires
+
+router = Router(tags=["gestion_comisiones"])
+
+
+class ComisionGestionDTO(Schema):
+    id: int
+    codigo: str
+    anio_lectivo: int
+    turno_nombre: str
+    cantidad_inscriptos: int
+    cupo_maximo: int | None
+
+
+class CrearComisionIn(Schema):
+    materia_id: int
+    anio_lectivo: int
+    codigo: str
+    turno_id: int | None = None
+    cupo_maximo: int | None = None
+
+
+class CrearComisionMasivaIn(Schema):
+    plan_id: int
+    anio_cursada: int
+    anio_lectivo: int
+    codigo: str
+    turno_id: int | None = None
+    cupo_maximo: int | None = None
+
+
+class DistribuirEstudiantesIn(Schema):
+    comision_origen_id: int
+    comision_destino_id: int
+    porcentaje: int = 50
+
+
+class MoverEstudiantesIn(Schema):
+    comision_destino_id: int
+    inscripcion_ids: list[int]
+
+
+@router.get("/materia/{materia_id}/anio/{anio_lectivo}", response=list[ComisionGestionDTO], auth=JWTAuth())
+@requires("editar_estructura")
+def listar_comisiones_gestion(request, materia_id: int, anio_lectivo: int):
+    materia = get_object_or_404(Materia.objects.select_related("plan_de_estudio"), id=materia_id)
+    ensure_profesorado_access(request.user, materia.plan_de_estudio.profesorado_id)
+
+    comisiones = (
+        Comision.objects.filter(materia=materia, anio_lectivo=anio_lectivo)
+        .annotate(
+            cantidad_inscriptos=Count(
+                "inscripciones", filter=Q(inscripciones__estado=InscripcionMateriaEstudiante.Estado.CONFIRMADA)
+            )
+        )
+        .order_by("codigo")
+    )
+
+    return [
+        ComisionGestionDTO(
+            id=c.id,
+            codigo=c.codigo,
+            anio_lectivo=c.anio_lectivo,
+            turno_nombre=c.turno.nombre if c.turno else "Sin turno",
+            cantidad_inscriptos=c.cantidad_inscriptos,
+            cupo_maximo=c.cupo_maximo,
+        )
+        for c in comisiones
+    ]
+
+
+@router.post("/crear", response={200: ApiResponse, 400: ApiResponse}, auth=JWTAuth())
+@requires("editar_estructura")
+def crear_comision(request, payload: CrearComisionIn):
+    materia = get_object_or_404(Materia.objects.select_related("plan_de_estudio"), id=payload.materia_id)
+    ensure_profesorado_access(request.user, materia.plan_de_estudio.profesorado_id)
+
+    if Comision.objects.filter(materia=materia, anio_lectivo=payload.anio_lectivo, codigo=payload.codigo).exists():
+        return 400, ApiResponse(
+            ok=False, message=f"Ya existe una comisión con el código {payload.codigo} para este año."
+        )
+
+    # Si no se especifica turno, intentar copiar de otra comision existente o default
+    turno = None
+    if payload.turno_id:
+        turno = Turno.objects.filter(id=payload.turno_id).first()
+
+    if not turno:
+        # Intentar buscar el turno de la comision 'A' o la primera que encuentre
+        otra_comision = Comision.objects.filter(materia=materia, anio_lectivo=payload.anio_lectivo).first()
+        if otra_comision:
+            turno = otra_comision.turno
+
+    if not turno:
+        # Fallback: Primer turno disponible (probablemente Tarde o Noche)
+        turno = Turno.objects.first()
+
+    from core.models import HorarioCatedra
+
+    hc = HorarioCatedra.objects.filter(espacio=materia, turno=turno).first()
+
+    comision = Comision.objects.create(
+        materia=materia,
+        anio_lectivo=payload.anio_lectivo,
+        codigo=payload.codigo,
+        turno=turno,
+        cupo_maximo=payload.cupo_maximo,
+        estado=Comision.Estado.ABIERTA,
+        horario=hc,
+    )
+
+    return ApiResponse(ok=True, message="Comisión creada exitosamente.", data={"id": comision.id})
+
+
+@router.post("/crear-masiva", response={200: ApiResponse, 400: ApiResponse}, auth=JWTAuth())
+@requires("editar_estructura")
+def crear_comision_masiva(request, payload: CrearComisionMasivaIn):
+    plan = get_object_or_404(PlanDeEstudio, id=payload.plan_id)
+    ensure_profesorado_access(request.user, plan.profesorado_id)
+
+    materias = Materia.objects.filter(plan_id=payload.plan_id, anio_cursada=payload.anio_cursada)
+
+    if not materias.exists():
+        return 400, ApiResponse(
+            ok=False, message="No se encontraron materias para el plan y año de cursada especificados."
+        )
+
+    created_count = 0
+
+    # Determinar turno (similar a crear_comision)
+    turno = None
+    if payload.turno_id:
+        turno = Turno.objects.filter(id=payload.turno_id).first()
+
+    if not turno:
+        turno = Turno.objects.first()
+
+    for materia in materias:
+        if not Comision.objects.filter(
+            materia=materia, anio_lectivo=payload.anio_lectivo, codigo=payload.codigo
+        ).exists():
+            from core.models import HorarioCatedra
+
+            hc = HorarioCatedra.objects.filter(espacio=materia, turno=turno).first()
+
+            Comision.objects.create(
+                materia=materia,
+                anio_lectivo=payload.anio_lectivo,
+                codigo=payload.codigo,
+                turno=turno,
+                cupo_maximo=payload.cupo_maximo,
+                estado=Comision.Estado.ABIERTA,
+                horario=hc,
+            )
+            created_count += 1
+
+    if created_count == 0:
+        return ApiResponse(ok=True, message="No se crearon nuevas comisiones (ya existían todas).")
+
+    return ApiResponse(ok=True, message=f"Se crearon {created_count} comisiones para el {payload.anio_cursada}º año.")
+
+
+@router.post("/distribuir", response={200: ApiResponse, 400: ApiResponse}, auth=JWTAuth())
+@requires("editar_estructura")
+def distribuir_estudiantes(request, payload: DistribuirEstudiantesIn):
+    com_origen = get_object_or_404(
+        Comision.objects.select_related("materia__plan_de_estudio"), id=payload.comision_origen_id
+    )
+    com_destino = get_object_or_404(
+        Comision.objects.select_related("materia__plan_de_estudio"), id=payload.comision_destino_id
+    )
+    ensure_profesorado_access(request.user, com_origen.materia.plan_de_estudio.profesorado_id)
+    ensure_profesorado_access(request.user, com_destino.materia.plan_de_estudio.profesorado_id)
+
+    with transaction.atomic():
+        inscripciones = list(
+            InscripcionMateriaEstudiante.objects.filter(
+                comision=com_origen, estado=InscripcionMateriaEstudiante.Estado.CONFIRMADA
+            )
+        )
+
+        if not inscripciones:
+            return 400, ApiResponse(ok=False, message="La comisión de origen no tiene estudiantes inscriptos.")
+
+        cantidad_a_mover = int(len(inscripciones) * (payload.porcentaje / 100))
+
+        if cantidad_a_mover == 0:
+            return ApiResponse(ok=True, message="No hay suficientes estudiantes para mover con ese porcentaje.")
+
+        estudiantes_a_mover = random.sample(inscripciones, cantidad_a_mover)
+
+        for inscripcion in estudiantes_a_mover:
+            inscripcion.comision = com_destino
+            inscripcion.save(update_fields=["comision"])
+
+    return ApiResponse(ok=True, message=f"Se movieron {cantidad_a_mover} estudiantes a la nueva comisión.")
+
+
+@router.post("/mover", response={200: ApiResponse, 400: ApiResponse}, auth=JWTAuth())
+@requires("editar_estructura")
+def mover_estudiantes(request, payload: MoverEstudiantesIn):
+    com_destino = get_object_or_404(
+        Comision.objects.select_related("materia__plan_de_estudio"), id=payload.comision_destino_id
+    )
+    ensure_profesorado_access(request.user, com_destino.materia.plan_de_estudio.profesorado_id)
+
+    inscripciones = list(
+        InscripcionMateriaEstudiante.objects.filter(id__in=payload.inscripcion_ids).select_related(
+            "materia__plan_de_estudio"
+        )
+    )
+    for insc in inscripciones:
+        ensure_profesorado_access(request.user, insc.materia.plan_de_estudio.profesorado_id)
+
+    updated = InscripcionMateriaEstudiante.objects.filter(id__in=payload.inscripcion_ids).update(comision=com_destino)
+
+    return ApiResponse(ok=True, message=f"Se movieron {updated} estudiantes.")

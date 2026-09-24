@@ -1,0 +1,89 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  frontend:
+    name: Frontend (Node 22 + PNPM)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: frontend
+
+      - name: Run lint
+        run: pnpm run lint
+        working-directory: frontend
+
+      - name: Run tests
+        run: pnpm run test
+        working-directory: frontend
+
+      - name: Run build
+        run: pnpm run build
+        working-directory: frontend
+
+  backend:
+    name: Backend (Python 3.11 + UV)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: uv sync
+        working-directory: backend
+
+      - name: Run ruff check
+        run: uv run ruff check .
+        working-directory: backend
+
+      - name: Run ruff format check
+        run: uv run ruff format --check .
+        working-directory: backend
+
+      # Consulta la base de CVEs en cada corrida, que es el punto: una version
+      # segura hoy puede dejar de serlo manana sin que cambie una linea de codigo.
+      # continue-on-error para que un aviso no bloquee el pipeline: se revisa el
+      # log y se decide. Si se quiere que frene, sacar esa linea.
+      - name: Audit dependencies (pip-audit)
+        run: uvx pip-audit --disable-pip
+        working-directory: backend
+        continue-on-error: true
+
+      - name: Run backend tests
+        run: uv run pytest -v --no-migrations -o cache_dir=/tmp
+        working-directory: backend
+        env:
+          DB_ENGINE: sqlite
+          SECRET_KEY: ci-test-secret-key-not-for-production
+          SECURE_SSL_REDIRECT: "False"

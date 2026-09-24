@@ -1,0 +1,1484 @@
+import AddBoxIcon from "@mui/icons-material/AddBox";
+import CancelIcon from "@mui/icons-material/Cancel";
+import CheckCircleIcon from "@mui/icons-material/CheckCircle";
+import EditIcon from "@mui/icons-material/Edit";
+import FileDownloadIcon from "@mui/icons-material/FileDownload";
+import PrintIcon from "@mui/icons-material/Print";
+import RefreshIcon from "@mui/icons-material/Refresh";
+import SearchIcon from "@mui/icons-material/Search";
+import Alert from "@mui/material/Alert";
+import Box from "@mui/material/Box";
+import Button from "@mui/material/Button";
+import Chip from "@mui/material/Chip";
+import CircularProgress from "@mui/material/CircularProgress";
+import Dialog from "@mui/material/Dialog";
+import DialogActions from "@mui/material/DialogActions";
+import DialogContent from "@mui/material/DialogContent";
+import DialogTitle from "@mui/material/DialogTitle";
+import FormControl from "@mui/material/FormControl";
+import Grid from "@mui/material/Grid";
+import IconButton from "@mui/material/IconButton";
+import InputAdornment from "@mui/material/InputAdornment";
+import InputLabel from "@mui/material/InputLabel";
+import List from "@mui/material/List";
+import ListItem from "@mui/material/ListItem";
+import ListItemButton from "@mui/material/ListItemButton";
+import ListItemText from "@mui/material/ListItemText";
+import MenuItem from "@mui/material/MenuItem";
+import Paper from "@mui/material/Paper";
+import Select from "@mui/material/Select";
+import Stack from "@mui/material/Stack";
+import Table from "@mui/material/Table";
+import TableBody from "@mui/material/TableBody";
+import TableCell from "@mui/material/TableCell";
+import TableContainer from "@mui/material/TableContainer";
+import TableHead from "@mui/material/TableHead";
+import TablePagination from "@mui/material/TablePagination";
+import TableRow from "@mui/material/TableRow";
+import TableSortLabel from "@mui/material/TableSortLabel";
+import TextField from "@mui/material/TextField";
+import Tooltip from "@mui/material/Tooltip";
+import Typography from "@mui/material/Typography";
+import DOMPurify from "dompurify";
+import type React from "react";
+import { useEffect, useMemo, useState } from "react";
+import { type DocenteDTO, listarDocentes } from "@/api/docentes";
+import { type MesaPlanillaDTO, obtenerMesaPlanilla } from "@/api/estudiantes";
+import type { SolicitudMesaAdminDTO } from "@/api/estudiantes/types";
+import {
+	actualizarMesa,
+	crearMesaDesdeSolicitud,
+	listarMesas,
+	listarSolicitudesMesas,
+	procesarSolicitudMesa,
+} from "@/api/managementMesas";
+import { fetchVentanas, type VentanaDto } from "@/api/ventanas";
+import { useAuth } from "@/context/AuthContext";
+import { formatDate } from "@/utils/date";
+import { getIpesHeaderHtml, IPES_HEADER_CSS } from "@/utils/printActaHtml";
+
+export const SolicitudesList: React.FC = () => {
+	const { roleOverride, user } = useAuth();
+	const canEdit = useMemo(() => {
+		const roles = new Set(
+			roleOverride
+				? [roleOverride.toLowerCase()]
+				: user?.roles?.map((r: string) => r.toLowerCase()) || [],
+		);
+		// Coincide con el permiso "editar_estructura" del backend
+		// ({admin, secretaria, bedel}): el que puede procesar solicitudes de mesa
+		// también tiene que poder ver todos los llamados y sus mesas, no solo el
+		// último. Sin bedel acá, el bedel quedaba pegado a la última ventana sin
+		// forma de cambiar el filtro.
+		return (
+			roles.has("admin") ||
+			roles.has("secretaria") ||
+			roles.has("administrador") ||
+			roles.has("bedel")
+		);
+	}, [roleOverride, user]);
+	const canEditMesa = useMemo(() => {
+		const roles = new Set(
+			roleOverride
+				? [roleOverride.toLowerCase()]
+				: user?.roles?.map((r: string) => r.toLowerCase()) || [],
+		);
+		// A diferencia de canEdit, acá el bedel queda afuera: no debe poder
+		// modificar fecha/tribunal de una mesa ya aprobada, solo admin/secretaría.
+		return roles.has("admin") || roles.has("secretaria") || roles.has("administrador");
+	}, [roleOverride, user]);
+
+	const [solicitudes, setSolicitudes] = useState<SolicitudMesaAdminDTO[]>([]);
+	const [loading, setLoading] = useState(false);
+	const [selectedSolicitud, setSelectedSolicitud] =
+		useState<SolicitudMesaAdminDTO | null>(null);
+		const [mesasCompatibles, setMesasCompatibles] = useState<any[]>([]);
+	const [loadingMesas, setLoadingMesas] = useState(false);
+	const [openDialog, setOpenDialog] = useState(false);
+	const [docentes, setDocentes] = useState<DocenteDTO[]>([]);
+	const [openCreateMesaDialog, setOpenCreateMesaDialog] = useState(false);
+	const [openEditMesaDialog, setOpenEditMesaDialog] = useState(false);
+	const [editMesaData, setEditMesaData] = useState({
+		fecha: "",
+		hora_desde: "",
+		docente_presidente_id: "",
+		docente_vocal1_id: "",
+		docente_vocal2_id: "",
+		aula: "",
+		cupo: 40,
+		numero_mesa: "",
+	});
+
+	const handleEditMesaClick = async (s: SolicitudMesaAdminDTO) => {
+		setSelectedSolicitud(s);
+		if (s.mesa_asignada_id) {
+			try {
+				const planilla = await obtenerMesaPlanilla(s.mesa_asignada_id);
+				setEditMesaData({
+					fecha: planilla.fecha_iso || (s.fecha_solicitud ? s.fecha_solicitud.substring(0, 10) : ""),
+					hora_desde: planilla.hora_desde || "",
+					docente_presidente_id: "",
+					docente_vocal1_id: "",
+					docente_vocal2_id: "",
+					aula: planilla.aula || "",
+					cupo: planilla.cupo ?? 40,
+					numero_mesa: planilla.numero_mesa ? String(planilla.numero_mesa) : "",
+				});
+
+				// Buscar IDs de los docentes si coinciden los nombres en la lista de docentes cargada
+				const pres = docentes.find(
+					(d) =>
+						planilla.tribunal_presidente &&
+						`${d.apellido}, ${d.nombre}`.toUpperCase() === planilla.tribunal_presidente.toUpperCase(),
+				);
+				const voc1 = docentes.find(
+					(d) =>
+						planilla.tribunal_vocal1 &&
+						`${d.apellido}, ${d.nombre}`.toUpperCase() === planilla.tribunal_vocal1.toUpperCase(),
+				);
+				const voc2 = docentes.find(
+					(d) =>
+						planilla.tribunal_vocal2 &&
+						`${d.apellido}, ${d.nombre}`.toUpperCase() === planilla.tribunal_vocal2.toUpperCase(),
+				);
+
+				setEditMesaData((prev) => ({
+					...prev,
+					docente_presidente_id: pres ? String(pres.id) : "",
+					docente_vocal1_id: voc1 ? String(voc1.id) : "",
+					docente_vocal2_id: voc2 ? String(voc2.id) : "",
+				}));
+			} catch (_err) {
+				setEditMesaData({
+					fecha: s.fecha_solicitud ? s.fecha_solicitud.substring(0, 10) : "",
+					hora_desde: "",
+					docente_presidente_id: "",
+					docente_vocal1_id: "",
+					docente_vocal2_id: "",
+					aula: "",
+					cupo: 40,
+					numero_mesa: "",
+				});
+			}
+		} else {
+			setEditMesaData({
+				fecha: s.fecha_solicitud ? s.fecha_solicitud.substring(0, 10) : "",
+				hora_desde: "",
+				docente_presidente_id: "",
+				docente_vocal1_id: "",
+				docente_vocal2_id: "",
+				aula: "",
+				cupo: 40,
+				numero_mesa: "",
+			});
+		}
+		setOpenEditMesaDialog(true);
+	};
+
+	const handleConfirmEditMesa = async () => {
+		if (!selectedSolicitud?.mesa_asignada_id) return;
+		try {
+			await actualizarMesa(selectedSolicitud.mesa_asignada_id, {
+				materia_id: selectedSolicitud.materia_id,
+				tipo: "EXT",
+				modalidad: selectedSolicitud.modalidad || "REG",
+				fecha: editMesaData.fecha,
+				hora_desde: editMesaData.hora_desde || null,
+				aula: editMesaData.aula || null,
+				cupo: editMesaData.cupo,
+				docente_presidente_id: editMesaData.docente_presidente_id
+					? parseInt(editMesaData.docente_presidente_id)
+					: null,
+				docente_vocal1_id: editMesaData.docente_vocal1_id
+					? parseInt(editMesaData.docente_vocal1_id)
+					: null,
+				docente_vocal2_id: editMesaData.docente_vocal2_id
+					? parseInt(editMesaData.docente_vocal2_id)
+					: null,
+				numero_mesa: editMesaData.numero_mesa
+					? parseInt(editMesaData.numero_mesa)
+					: null,
+			});
+			setOpenEditMesaDialog(false);
+			setSelectedSolicitud(null);
+			await load();
+			alert("Mesa actualizada correctamente.");
+		} catch (e: any) {
+			alert(e.response?.data?.message || "Error al actualizar la mesa");
+		}
+	};
+
+	const [createMesaData, setCreateMesaData] = useState({
+		fecha: "",
+		hora_desde: "18:00",
+		docente_presidente_id: "",
+		docente_vocal1_id: "",
+		docente_vocal2_id: "",
+		aula: "",
+		cupo: 40,
+		numero_mesa: "",
+	});
+
+	const [ventanas, setVentanas] = useState<VentanaDto[]>([]);
+	const [selectedVentanaId, setSelectedVentanaId] = useState<string>("TODAS");
+
+	const load = async (ventanaIdFilter?: string) => {
+		setLoading(true);
+		try {
+			const vId = ventanaIdFilter !== undefined ? ventanaIdFilter : selectedVentanaId;
+			const params: { ventana_id?: number } = {};
+			if (vId === "TODAS") {
+				params.ventana_id = -1;
+			} else if (vId) {
+				params.ventana_id = parseInt(vId, 10);
+			}
+			const data = await listarSolicitudesMesas(params);
+			setSolicitudes(data);
+		} catch (_e) {
+			void 0;
+		} finally {
+			setLoading(false);
+		}
+	};
+
+	useEffect(() => {
+		fetchVentanas({ tipo: "MESAS_EXTRA" })
+			.then((vList) => {
+				setVentanas(vList);
+				// Si hay un llamado activo, se abre enfocado en ese (es el que se
+				// está trabajando). Si no hay ninguno activo, se muestran TODOS los
+				// llamados en vez de caer al último: cuando hay dos llamados
+				// extraordinarios seguidos, el bedel necesita ver las solicitudes y
+				// mesas de ambos, no solo las del más reciente.
+				const activa = vList.find((v) => v.activo);
+				const defaultId = activa ? String(activa.id) : "TODAS";
+				setSelectedVentanaId(defaultId);
+				load(defaultId);
+			})
+			.catch(() => {
+				load("TODAS");
+			});
+		listarDocentes().then(setDocentes).catch(console.error);
+	}, []);
+
+	const handleAprobarClick = async (s: SolicitudMesaAdminDTO) => {
+		setSelectedSolicitud(s);
+		setOpenDialog(true);
+		setLoadingMesas(true);
+		try {
+			// Buscamos mesas extraordinarias de la misma materia
+			const data = await listarMesas({ materia_id: s.materia_id });
+			// Filtramos solo las EXT o las que correspondan al período
+						setMesasCompatibles((data as any[]).filter((m) => m.tipo === "EXT"));
+		} catch (_e) {
+			void 0;
+		} finally {
+			setLoadingMesas(false);
+		}
+	};
+
+	const handleCreateMesaClick = (s: SolicitudMesaAdminDTO) => {
+		setSelectedSolicitud(s);
+		setOpenCreateMesaDialog(true);
+	};
+
+	const handleConfirmCreateMesa = async () => {
+		if (!selectedSolicitud) return;
+		if (!createMesaData.fecha || !createMesaData.docente_presidente_id) {
+			alert("Debe completar al menos la Fecha y el Presidente del Tribunal.");
+			return;
+		}
+
+		try {
+			await crearMesaDesdeSolicitud({
+				solicitud_id: selectedSolicitud.id,
+				fecha: createMesaData.fecha,
+				hora_desde: createMesaData.hora_desde,
+				aula: createMesaData.aula,
+				cupo: createMesaData.cupo,
+				docente_presidente_id: parseInt(createMesaData.docente_presidente_id),
+				docente_vocal1_id: createMesaData.docente_vocal1_id
+					? parseInt(createMesaData.docente_vocal1_id)
+					: null,
+				docente_vocal2_id: createMesaData.docente_vocal2_id
+					? parseInt(createMesaData.docente_vocal2_id)
+					: null,
+				numero_mesa: createMesaData.numero_mesa
+					? parseInt(createMesaData.numero_mesa)
+					: null,
+			});
+
+			setOpenCreateMesaDialog(false);
+			setSelectedSolicitud(null);
+			await load();
+			alert("Mesa creada y alumnos vinculados correctamente.");
+					} catch (e: any) {
+			void 0;
+			alert(e.response?.data?.message || "Error al crear la mesa");
+		}
+	};
+
+	const confirmAprobar = async (mesaId: number) => {
+		if (!selectedSolicitud) return;
+		try {
+			await procesarSolicitudMesa(selectedSolicitud.id, "PRO", mesaId);
+			setOpenDialog(false);
+			setSelectedSolicitud(null);
+			await load();
+		} catch (_e) {
+			void 0;
+			alert("Error al vincular la mesa");
+		}
+	};
+
+	const handleImprimirActa = async (s: SolicitudMesaAdminDTO) => {
+		if (!s.mesa_asignada_id) return;
+		try {
+			const planilla = await obtenerMesaPlanilla(s.mesa_asignada_id);
+			imprimirPlanilla(planilla);
+		} catch (_e) {
+			alert("No se pudo obtener la planilla de la mesa.");
+		}
+	};
+
+	const handleRechazar = async (id: number) => {
+		if (!window.confirm(`¿Estás seguro de RECHAZAR esta solicitud?`)) return;
+		try {
+			await procesarSolicitudMesa(id, "REC");
+			await load();
+		} catch (_e) {
+			void 0;
+			alert("Error al rechazar la solicitud");
+		}
+	};
+
+		const imprimirPlanilla = async (planilla: MesaPlanillaDTO) => {
+		const parseFecha = (s: string | null | undefined): string => {
+			if (!s) return "-";
+			const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+			return m ? `${m[3]}/${m[2]}/${m[1]}` : s;
+		};
+		const numToText = (n: number): string => {
+			const u = [
+				"CERO",
+				"UNO",
+				"DOS",
+				"TRES",
+				"CUATRO",
+				"CINCO",
+				"SEIS",
+				"SIETE",
+				"OCHO",
+				"NUEVE",
+			];
+			const esp: Record<number, string> = {
+				10: "DIEZ",
+				11: "ONCE",
+				12: "DOCE",
+				13: "TRECE",
+				14: "CATORCE",
+				15: "QUINCE",
+			};
+			const d = [
+				"",
+				"",
+				"VEINTE",
+				"TREINTA",
+				"CUARENTA",
+				"CINCUENTA",
+				"SESENTA",
+				"SETENTA",
+				"OCHENTA",
+				"NOVENTA",
+			];
+			if (n < 10) return u[n];
+			if (esp[n]) return esp[n];
+			if (n < 20) return `DIECI${u[n - 10]}`;
+			if (n === 20) return "VEINTE";
+			if (n < 30) return `VEINTI${u[n - 20]}`;
+			const di = Math.floor(n / 10),
+				ui = n % 10;
+			return ui === 0 ? d[di] : `${d[di]} Y ${u[ui]}`;
+		};
+
+		const fecha = parseFecha(planilla.fecha);
+		const hora = planilla.hora_desde || "08:00";
+		const materiaAnio = planilla.materia_anio
+			? `${planilla.materia_anio}º AÑO`
+			: "";
+		const sorted = [...planilla.estudiantes]
+			.map((e) => ({ ...e, _display: (e.apellido_nombre || "").toUpperCase() }))
+			.sort((a, b) => a._display.localeCompare(b._display, "es"));
+
+		const total = sorted.length;
+		const ausentes = sorted.filter((e) => e.condicion === "AUS").length;
+		const aprobados = sorted.filter(
+			(e) =>
+				e.condicion === "APR" ||
+				(e.nota !== null && e.nota !== undefined && Number(e.nota) >= 4),
+		).length;
+				const desaprobados = total - ausentes - aprobados;
+
+		// Solo filas reales — sin relleno
+		const estudiantesRows = sorted
+			.map(
+				(e, i) => `
+      <tr>
+        <td class="tc">${i + 1}.</td>
+        <td class="tc">${e.dni}</td>
+        <td>${e._display}</td>
+        <td class="tc"></td>
+        <td class="tc"></td>
+        <td class="tc">${e.nota !== null && e.nota !== undefined ? e.nota : ""}</td>
+      </tr>`,
+			)
+			.join("");
+
+				const vocales = [planilla.tribunal_vocal1, planilla.tribunal_vocal2]
+			.filter(Boolean)
+			.map((v) => v!.toUpperCase())
+			.join(" / ");
+
+		const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Acta de Examen</title><style>
+      @page { size: A4; margin: 12mm 14mm 18mm 14mm; }
+      body { font-family: Arial, Helvetica, sans-serif; font-size: 9pt; color: #000; margin: 0; }
+      ${IPES_HEADER_CSS}
+      h1 { text-align: center; font-size: 12pt; font-weight: bold; letter-spacing: 1px; margin: 3mm 0 4mm 0; }
+      .info { font-size: 9pt; margin-bottom: 1.5mm; }
+      .info b { font-weight: bold; }
+      .row-info { display: flex; gap: 6mm; margin-bottom: 1.5mm; font-size: 9pt; }
+      table { width: 100%; border-collapse: collapse; margin-top: 3mm; font-size: 8.5pt; }
+      th { border: 1px solid #000; padding: 3px 4px; text-align: center; font-weight: bold; font-size: 8pt; }
+      td { border: 1px solid #000; padding: 3px 4px; min-height: 12px; }
+      .tc { text-align: center; }
+      .totales-table { width: 100%; margin-top: 4mm; font-size: 8.5pt; border: none; border-collapse: collapse; table-layout: fixed; }
+      .totales-table td { border: none; padding: 1mm 2mm; white-space: nowrap; overflow: hidden; }
+      .obs { margin-top: 3mm; font-size: 8.5pt; }
+      .obs-line { border-bottom: 1px solid #000; height: 5mm; margin-top: 1mm; }
+      .firmas { display: flex; justify-content: space-around; margin-top: 14mm; }
+      .firma-box { flex: 1; text-align: center; }
+      .linea-firma { border-top: 1px solid #000; margin: 0 8mm 2px; padding-top: 2px; font-size: 8pt; }
+      .rol { font-weight: bold; font-size: 8pt; }
+      .footer { position: fixed; bottom: 4mm; left: 0; right: 0; text-align: center; font-size: 7pt; font-style: italic; }
+    </style></head><body>
+      ${await getIpesHeaderHtml()}
+      <h1>ACTA DE EXAMEN</h1>
+      <div style="text-align:center; font-size:11pt; font-weight:bold; margin-bottom:2mm; letter-spacing:0.5px;">
+        MODALIDAD: ${planilla.modalidad === "LIB" ? "LIBRE" : "REGULAR"}
+      </div>
+      <div class="info" style="text-align:center;"><b>PROFESORADO DE:</b> ${(planilla.profesorado_nombre || "").replace(/^profesorado de /i, "").toUpperCase()}</div>
+      <div class="row-info">
+        <span><b>ACTA N°:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>
+        <span><b>FOLIO N°:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>
+        <span><b>FECHA:</b> ${fecha}</span>
+        <span><b>HORA:</b> ${hora}</span>
+        <span><b>MESA N°:</b> ${planilla.numero_mesa ?? "-"}</span>
+      </div>
+      <div class="row-info">
+        <span><b>UNIDAD CURRICULAR:</b> ${planilla.materia_nombre.toUpperCase()}</span>
+        <span><b>${materiaAnio}</b></span>
+        <span><b>PLAN:</b> ${planilla.plan_resolucion || "-"}</span>
+      </div>
+      <div class="info"><b>PROFESOR TITULAR:</b> ${(planilla.tribunal_presidente || "").toUpperCase()}</div>
+      <div class="info"><b>PROFESORES/AS VOCALES:</b> ${vocales || "________________________________"}</div>
+
+      <table>
+        <thead><tr>
+          <th style="width:22px">Nº</th>
+          <th style="width:68px">D.N.I.</th>
+          <th>APELLIDO Y NOMBRE DEL ALUMNO</th>
+          <th style="width:65px">EXAMEN<br>ESCRITO</th>
+          <th style="width:65px">EXAMEN<br>ORAL</th>
+          <th style="width:65px">PROMEDIO</th>
+        </tr></thead>
+        <tbody>${estudiantesRows}</tbody>
+      </table>
+
+      <div style="margin-top:4mm; font-size:8.5pt; display:grid; grid-template-columns:1fr 1fr; gap:1mm 6mm;">
+        <div>Total de alumnos inscriptos: <b>${total}</b> (<b>${numToText(total)}</b>)</div>
+        <div>Total de alumnos ausentes: <span style="display:inline-block;width:8mm;border-bottom:1px solid #000;">&nbsp;</span> (<span style="display:inline-block;width:28mm;border-bottom:1px solid #000;">&nbsp;</span>)</div>
+        <div>Total de alumnos aprobados: <span style="display:inline-block;width:8mm;border-bottom:1px solid #000;">&nbsp;</span> (<span style="display:inline-block;width:28mm;border-bottom:1px solid #000;">&nbsp;</span>)</div>
+        <div>Total de alumnos desaprobados: <span style="display:inline-block;width:8mm;border-bottom:1px solid #000;">&nbsp;</span> (<span style="display:inline-block;width:28mm;border-bottom:1px solid #000;">&nbsp;</span>)</div>
+      </div>
+
+      <div class="obs"><b>OBSERVACIONES:</b><div class="obs-line"></div><div class="obs-line"></div></div>
+
+      <div class="firmas">
+        <div class="firma-box"><div class="linea-firma">${(planilla.tribunal_vocal1 || "").toUpperCase()}</div><div class="rol">Vocal</div></div>
+        <div class="firma-box"><div class="linea-firma">${(planilla.tribunal_presidente || "").toUpperCase()}</div><div class="rol">Presidente</div></div>
+        <div class="firma-box"><div class="linea-firma">${(planilla.tribunal_vocal2 || "").toUpperCase()}</div><div class="rol">Vocal</div></div>
+      </div>
+      <div class="footer">"Las Islas Malvinas, Georgia y Sándwich del Sur, son y serán Argentinas"</div>
+    </body></html>`;
+		const w = window.open("", "_blank");
+		if (w) {
+						w.document.write(DOMPurify.sanitize(html, { WHOLE_DOCUMENT: true }));
+			w.document.close();
+			w.focus();
+			w.onload = () => w.print();
+		}
+	};
+
+	const [search, setSearch] = useState("");
+	const [filtroEstado, setFiltroEstado] = useState("");
+	const [filtroProfesorado, setFiltroProfesorado] = useState("");
+	const [orderBy, setOrderBy] = useState<string>("fecha_solicitud");
+	const [order, setOrder] = useState<"asc" | "desc">("desc");
+	const [page, setPage] = useState(0);
+	const [rowsPerPage, setRowsPerPage] = useState(25);
+
+	const handleRequestSort = (property: string) => {
+		const isAsc = orderBy === property && order === "asc";
+		setOrder(isAsc ? "desc" : "asc");
+		setOrderBy(property);
+	};
+
+	// Lista de profesorados únicos para el selector de filtro
+	const profesoradosDisponibles = useMemo(() => {
+		const profs = new Set<string>();
+		solicitudes.forEach((s) => {
+			if (s.profesorado_nombre) profs.add(s.profesorado_nombre);
+		});
+		return Array.from(profs).sort();
+	}, [solicitudes]);
+
+	// Filtrado y ordenamiento de las solicitudes
+	const processedSolicitudes = useMemo(() => {
+		let list = [...solicitudes];
+
+		if (search.trim()) {
+			const q = search.toLowerCase().trim();
+			list = list.filter(
+				(s) =>
+					s.estudiante_nombre?.toLowerCase().includes(q) ||
+					s.estudiante_dni?.includes(q) ||
+					s.materia_nombre?.toLowerCase().includes(q) ||
+					s.profesorado_nombre?.toLowerCase().includes(q) ||
+					s.docente_nombre?.toLowerCase().includes(q),
+			);
+		}
+
+		if (filtroEstado) {
+			list = list.filter((s) => s.estado === filtroEstado);
+		}
+
+		if (filtroProfesorado) {
+			list = list.filter((s) => s.profesorado_nombre === filtroProfesorado);
+		}
+
+		list.sort((a, b) => {
+			let valA: any = (a as any)[orderBy];
+			let valB: any = (b as any)[orderBy];
+
+			if (valA == null) valA = "";
+			if (valB == null) valB = "";
+
+			if (typeof valA === "string") {
+				valA = valA.toLowerCase();
+				valB = (valB as string).toLowerCase();
+			}
+
+			if (valA < valB) return order === "asc" ? -1 : 1;
+			if (valA > valB) return order === "asc" ? 1 : -1;
+			return 0;
+		});
+
+		return list;
+	}, [solicitudes, search, filtroEstado, filtroProfesorado, orderBy, order]);
+
+	const paginatedSolicitudes = useMemo(() => {
+		return processedSolicitudes.slice(
+			page * rowsPerPage,
+			page * rowsPerPage + rowsPerPage,
+		);
+	}, [processedSolicitudes, page, rowsPerPage]);
+
+	const handleExportExcel = () => {
+		if (processedSolicitudes.length === 0) return;
+
+		const BOM = "\uFEFF";
+		const headers = [
+			"Fecha Pedido",
+			"Fecha Mesa",
+			"Hora Mesa",
+			"N° Mesa",
+			"Aula",
+			"Estudiante",
+			"DNI",
+			"Materia",
+			"Año Materia",
+			"Docente Cátedra",
+			"Condición",
+			"Profesorado",
+			"Presidente Tribunal",
+			"Vocales Tribunal",
+			"Estado",
+		];
+
+		const rows = processedSolicitudes.map((s) => [
+			s.fecha_solicitud ? formatDate(s.fecha_solicitud) : "",
+			s.fecha_mesa ? formatDate(s.fecha_mesa) : "",
+			s.hora_mesa || "",
+			s.numero_mesa != null ? String(s.numero_mesa) : "",
+			`"${(s.aula_mesa || "").replace(/"/g, '""')}"`,
+			`"${(s.estudiante_nombre || "").replace(/"/g, '""')}"`,
+			`"${s.estudiante_dni || ""}"`,
+			`"${(s.materia_nombre || "").replace(/"/g, '""')}"`,
+			s.materia_anio ? `"${s.materia_anio}º Año"` : "",
+			`"${(s.docente_nombre || "Sin docente asignado").replace(/"/g, '""')}"`,
+			s.modalidad_display || (s.modalidad === "REG" ? "Regular" : "Libre"),
+			`"${(s.profesorado_nombre || "").replace(/"/g, '""')}"`,
+			`"${(s.tribunal_presidente || "Sin designar").replace(/"/g, '""')}"`,
+			`"${([s.tribunal_vocal1, s.tribunal_vocal2].filter(Boolean).join(" / ") || "Sin designar").replace(/"/g, '""')}"`,
+			s.estado_display || s.estado,
+		]);
+
+		const csvContent =
+			BOM +
+			[headers.join(";"), ...rows.map((row) => row.join(";"))].join("\r\n");
+
+		const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+		const url = URL.createObjectURL(blob);
+		const link = document.createElement("a");
+		link.setAttribute("href", url);
+		link.setAttribute(
+			"download",
+			`Solicitudes_Mesas_Extraordinarias_${new Date().toISOString().split("T")[0]}.csv`,
+		);
+		document.body.appendChild(link);
+		link.click();
+		document.body.removeChild(link);
+		URL.revokeObjectURL(url);
+	};
+
+	if (loading && solicitudes.length === 0) return <CircularProgress />;
+
+	return (
+		<Box>
+			<Stack
+				direction={{ xs: "column", sm: "row" }}
+				justifyContent="space-between"
+				alignItems={{ xs: "stretch", sm: "center" }}
+				spacing={2}
+				mb={2}
+			>
+				<Typography variant="h6" fontWeight={700}>
+					Gestión de Solicitudes Extraordinarias
+				</Typography>
+				<Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap">
+					<FormControl size="small" sx={{ minWidth: 260 }}>
+						<InputLabel id="select-ventana-label">Llamado / Período</InputLabel>
+						<Select
+							labelId="select-ventana-label"
+							value={selectedVentanaId}
+							label="Llamado / Período"
+							onChange={(e) => {
+								const val = e.target.value;
+								setSelectedVentanaId(val);
+								setPage(0);
+								load(val);
+							}}
+						>
+							{ventanas
+								.filter((v) => canEdit || v.activo)
+								.map((v) => {
+									const labelLlamado = v.periodo && !v.periodo.includes("1C") && !v.periodo.includes("2C")
+										? v.periodo
+										: `Llamado Extraordinario (${formatDate(v.desde)} - ${formatDate(v.hasta)})`;
+									return (
+										<MenuItem key={v.id} value={String(v.id)}>
+											{labelLlamado} {v.activo ? "🟢 (Activo)" : "⚪ (Histórico)"}
+										</MenuItem>
+									);
+								})}
+							{canEdit && (
+								<MenuItem value="TODAS">
+									<em>Todos los llamados (Histórico completo)</em>
+								</MenuItem>
+							)}
+						</Select>
+					</FormControl>
+					<Button
+						variant="contained"
+						color="success"
+						startIcon={<FileDownloadIcon />}
+						disabled={processedSolicitudes.length === 0}
+						onClick={handleExportExcel}
+						size="small"
+					>
+						Exportar Excel ({processedSolicitudes.length})
+					</Button>
+					<IconButton onClick={() => load()} disabled={loading} color="primary">
+						<RefreshIcon />
+					</IconButton>
+				</Stack>
+			</Stack>
+
+			<Paper sx={{ p: 2, mb: 2, borderRadius: 2 }} variant="outlined">
+				<Grid container spacing={2} alignItems="center">
+					<Grid item xs={12} md={5}>
+						<TextField
+							placeholder="Buscar por Estudiante, DNI, Materia, Profesorado o Docente..."
+							fullWidth
+							size="small"
+							value={search}
+							onChange={(e) => {
+								setSearch(e.target.value);
+								setPage(0);
+							}}
+							InputProps={{
+								startAdornment: (
+									<InputAdornment position="start">
+										<SearchIcon fontSize="small" color="action" />
+									</InputAdornment>
+								),
+							}}
+						/>
+					</Grid>
+					<Grid item xs={12} sm={6} md={3.5}>
+						<FormControl fullWidth size="small">
+							<InputLabel id="filtro-prof-label">Profesorado</InputLabel>
+							<Select
+								labelId="filtro-prof-label"
+								value={filtroProfesorado}
+								label="Profesorado"
+								onChange={(e) => {
+									setFiltroProfesorado(e.target.value);
+									setPage(0);
+								}}
+							>
+								<MenuItem value="">Todos los profesorados</MenuItem>
+								{profesoradosDisponibles.map((p) => (
+									<MenuItem key={p} value={p}>
+										{p}
+									</MenuItem>
+								))}
+							</Select>
+						</FormControl>
+					</Grid>
+					<Grid item xs={12} sm={6} md={3.5}>
+						<FormControl fullWidth size="small">
+							<InputLabel id="filtro-estado-label">Estado</InputLabel>
+							<Select
+								labelId="filtro-estado-label"
+								value={filtroEstado}
+								label="Estado"
+								onChange={(e) => {
+									setFiltroEstado(e.target.value);
+									setPage(0);
+								}}
+							>
+								<MenuItem value="">Todos los estados</MenuItem>
+								<MenuItem value="PEN">Pendiente</MenuItem>
+								<MenuItem value="PRO">Aprobada / En Mesa</MenuItem>
+								<MenuItem value="REC">Rechazada</MenuItem>
+							</Select>
+						</FormControl>
+					</Grid>
+				</Grid>
+			</Paper>
+
+			<TableContainer component={Paper} variant="outlined">
+				<Table size="small">
+					<TableHead sx={{ bgcolor: "grey.50" }}>
+						<TableRow>
+							<TableCell sx={{ fontWeight: 700 }}>
+								<TableSortLabel
+									active={orderBy === "fecha_solicitud"}
+									direction={orderBy === "fecha_solicitud" ? order : "asc"}
+									onClick={() => handleRequestSort("fecha_solicitud")}
+								>
+									Fecha Pedido
+								</TableSortLabel>
+							</TableCell>
+							<TableCell sx={{ fontWeight: 700 }}>
+								<TableSortLabel
+									active={orderBy === "fecha_mesa"}
+									direction={orderBy === "fecha_mesa" ? order : "asc"}
+									onClick={() => handleRequestSort("fecha_mesa")}
+								>
+									Fecha Mesa
+								</TableSortLabel>
+							</TableCell>
+							<TableCell sx={{ fontWeight: 700 }}>
+								<TableSortLabel
+									active={orderBy === "estudiante_nombre"}
+									direction={orderBy === "estudiante_nombre" ? order : "asc"}
+									onClick={() => handleRequestSort("estudiante_nombre")}
+								>
+									Estudiante
+								</TableSortLabel>
+							</TableCell>
+							<TableCell sx={{ fontWeight: 700 }}>
+								<TableSortLabel
+									active={orderBy === "estudiante_dni"}
+									direction={orderBy === "estudiante_dni" ? order : "asc"}
+									onClick={() => handleRequestSort("estudiante_dni")}
+								>
+									DNI
+								</TableSortLabel>
+							</TableCell>
+							<TableCell sx={{ fontWeight: 700 }}>
+								<TableSortLabel
+									active={orderBy === "materia_nombre"}
+									direction={orderBy === "materia_nombre" ? order : "asc"}
+									onClick={() => handleRequestSort("materia_nombre")}
+								>
+									Materia
+								</TableSortLabel>
+							</TableCell>
+							<TableCell sx={{ fontWeight: 700 }}>
+								<TableSortLabel
+									active={orderBy === "docente_nombre"}
+									direction={orderBy === "docente_nombre" ? order : "asc"}
+									onClick={() => handleRequestSort("docente_nombre")}
+								>
+									Docente Cátedra
+								</TableSortLabel>
+							</TableCell>
+							<TableCell sx={{ fontWeight: 700 }}>
+								<TableSortLabel
+									active={orderBy === "modalidad"}
+									direction={orderBy === "modalidad" ? order : "asc"}
+									onClick={() => handleRequestSort("modalidad")}
+								>
+									Condición
+								</TableSortLabel>
+							</TableCell>
+							<TableCell sx={{ fontWeight: 700 }}>
+								<TableSortLabel
+									active={orderBy === "profesorado_nombre"}
+									direction={orderBy === "profesorado_nombre" ? order : "asc"}
+									onClick={() => handleRequestSort("profesorado_nombre")}
+								>
+									Profesorado
+								</TableSortLabel>
+							</TableCell>
+							<TableCell sx={{ fontWeight: 700 }}>
+								Tribunal / Mesa
+							</TableCell>
+							<TableCell sx={{ fontWeight: 700 }}>
+								<TableSortLabel
+									active={orderBy === "estado"}
+									direction={orderBy === "estado" ? order : "asc"}
+									onClick={() => handleRequestSort("estado")}
+								>
+									Estado
+								</TableSortLabel>
+							</TableCell>
+							<TableCell align="center" sx={{ fontWeight: 700 }}>
+								Acciones
+							</TableCell>
+						</TableRow>
+					</TableHead>
+					<TableBody>
+						{paginatedSolicitudes.map((s) => (
+							<TableRow key={s.id} hover>
+								<TableCell>{formatDate(s.fecha_solicitud)}</TableCell>
+								<TableCell>
+									{s.estado === "PRO" && s.fecha_mesa ? (
+										<Typography variant="body2" sx={{ fontWeight: 600, color: "text.primary" }}>
+											{formatDate(s.fecha_mesa)}
+											{s.hora_mesa ? ` (${s.hora_mesa} hs)` : ""}
+										</Typography>
+									) : (
+										<Typography variant="caption" color="text.secondary">
+											—
+										</Typography>
+									)}
+								</TableCell>
+								<TableCell sx={{ fontWeight: 600 }}>{s.estudiante_nombre}</TableCell>
+								<TableCell>{s.estudiante_dni}</TableCell>
+								<TableCell>
+									<Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+										<Typography variant="body2" sx={{ fontWeight: 500 }}>
+											{s.materia_nombre}
+										</Typography>
+										{s.materia_anio != null && (
+											<Chip
+												label={`${s.materia_anio}º año`}
+												size="small"
+												variant="filled"
+												sx={{
+													height: 20,
+													fontSize: "0.7rem",
+													fontWeight: 700,
+													backgroundColor: "primary.light",
+													color: "primary.contrastText",
+												}}
+											/>
+										)}
+									</Stack>
+								</TableCell>
+								<TableCell>
+									{s.docente_nombre ? (
+										<Typography variant="body2" sx={{ fontWeight: 500, color: "primary.dark" }}>
+											{s.docente_nombre}
+										</Typography>
+									) : (
+										<Typography variant="caption" color="text.secondary" sx={{ fontStyle: "italic" }}>
+											Sin docente asignado
+										</Typography>
+									)}
+								</TableCell>
+								<TableCell>
+									<Chip
+										label={
+											s.modalidad_display ||
+											(s.modalidad === "REG" ? "Regular" : "Libre")
+										}
+										variant="outlined"
+										size="small"
+										color={s.modalidad === "LIB" ? "secondary" : "default"}
+									/>
+								</TableCell>
+								<TableCell>{s.profesorado_nombre}</TableCell>
+								<TableCell>
+									{s.estado === "PRO" && s.mesa_asignada_id ? (
+										<Box sx={{ fontSize: "0.8rem", lineHeight: 1.3 }}>
+											<Typography variant="caption" display="block" sx={{ fontWeight: 600, color: "text.primary" }}>
+												{s.numero_mesa ? `Mesa N° ${s.numero_mesa}` : `Mesa #${s.mesa_asignada_id}`}
+												{s.aula_mesa ? ` · Aula ${s.aula_mesa}` : ""}
+											</Typography>
+											<Typography variant="caption" display="block" color="text.secondary">
+												<b>Pres:</b> {s.tribunal_presidente || "Sin designar"}
+											</Typography>
+											{([s.tribunal_vocal1, s.tribunal_vocal2].filter(Boolean).length > 0) && (
+												<Typography variant="caption" display="block" color="text.secondary">
+													<b>Voc:</b> {[s.tribunal_vocal1, s.tribunal_vocal2].filter(Boolean).join(" / ")}
+												</Typography>
+											)}
+										</Box>
+									) : (
+										<Typography variant="caption" color="text.secondary" sx={{ fontStyle: "italic" }}>
+											{s.estado === "PEN" ? "Pendiente de mesa" : "—"}
+										</Typography>
+									)}
+								</TableCell>
+								<TableCell>
+									<Chip
+										label={s.estado_display}
+										color={
+											s.estado === "PRO"
+												? "success"
+												: s.estado === "REC"
+													? "error"
+													: "warning"
+										}
+										size="small"
+									/>
+								</TableCell>
+								<TableCell align="center">
+									{s.estado === "PEN" && (
+										canEdit ? (
+											<Stack direction="row" spacing={1} justifyContent="center">
+												<Tooltip title="Vincular a Mesa Existente">
+													<IconButton
+														size="small"
+														color="success"
+														onClick={() => handleAprobarClick(s)}
+													>
+														<CheckCircleIcon fontSize="small" />
+													</IconButton>
+												</Tooltip>
+												<Tooltip title="Crear Mesa Nueva (Agrupa similares)">
+													<IconButton
+														size="small"
+														color="primary"
+														onClick={() => handleCreateMesaClick(s)}
+													>
+														<AddBoxIcon fontSize="small" />
+													</IconButton>
+												</Tooltip>
+												<Tooltip title="Rechazar">
+													<IconButton
+														size="small"
+														color="error"
+														onClick={() => handleRechazar(s.id)}
+													>
+														<CancelIcon fontSize="small" />
+													</IconButton>
+												</Tooltip>
+											</Stack>
+										) : (
+											<Typography variant="caption" color="text.secondary" sx={{ fontStyle: "italic" }}>
+												Solo lectura
+											</Typography>
+										)
+									)}
+									{s.estado !== "PEN" && (
+										<Stack
+											direction="row"
+											spacing={0.5}
+											justifyContent="center"
+										>
+											{s.estado === "PRO" && s.mesa_asignada_id && (
+												<>
+													{canEditMesa && (
+														<Tooltip title="Editar Mesa">
+															<IconButton
+																size="small"
+																color="warning"
+																onClick={() => handleEditMesaClick(s)}
+															>
+																<EditIcon fontSize="small" />
+															</IconButton>
+														</Tooltip>
+													)}
+													<Tooltip title="Imprimir Acta de Examen">
+														<IconButton
+															size="small"
+															color="primary"
+															onClick={() => handleImprimirActa(s)}
+														>
+															<PrintIcon fontSize="small" />
+														</IconButton>
+													</Tooltip>
+												</>
+											)}
+											{s.estado === "REC" && (
+												<Typography variant="caption" color="error">
+													Rechazada
+												</Typography>
+											)}
+										</Stack>
+									)}
+								</TableCell>
+							</TableRow>
+						))}
+						{processedSolicitudes.length === 0 && (
+							<TableRow>
+								<TableCell colSpan={11} align="center" sx={{ py: 4 }}>
+									No se encontraron solicitudes con los filtros aplicados.
+								</TableCell>
+							</TableRow>
+						)}
+					</TableBody>
+				</Table>
+				<TablePagination
+					rowsPerPageOptions={[10, 25, 50, 100]}
+					component="div"
+					count={processedSolicitudes.length}
+					rowsPerPage={rowsPerPage}
+					page={page}
+					onPageChange={(_e, newPage) => setPage(newPage)}
+					onRowsPerPageChange={(e) => {
+						setRowsPerPage(parseInt(e.target.value, 10));
+						setPage(0);
+					}}
+					labelRowsPerPage="Filas por página:"
+					labelDisplayedRows={({ from, to, count }) =>
+						`${from}-${to} de ${count !== -1 ? count : `más de ${to}`}`
+					}
+				/>
+			</TableContainer>
+			<Dialog
+				open={openDialog}
+				onClose={() => setOpenDialog(false)}
+				maxWidth="sm"
+				fullWidth
+			>
+				<DialogTitle sx={{ fontWeight: 700 }}>
+					Vincular a Mesa de Examen
+				</DialogTitle>
+				<DialogContent dividers>
+					<Typography variant="body2" color="textSecondary" sx={{ mb: 2 }}>
+						Seleccioná la mesa extraordinaria a la cual querés incorporar a{" "}
+						<b>{selectedSolicitud?.estudiante_nombre}</b> para la materia{" "}
+						<b>{selectedSolicitud?.materia_nombre}</b>.
+						<br />
+						<i>
+							Al aprobar, el alumno quedará inscripto automáticamente y no podrá
+							darse de baja.
+						</i>
+					</Typography>
+
+					{loadingMesas ? (
+						<CircularProgress size={24} />
+					) : (
+						<List sx={{ pt: 0 }}>
+							{mesasCompatibles.length === 0 ? (
+								<Alert severity="warning">
+									No hay mesas extraordinarias creadas para esta materia. Debes
+									crear la mesa primero en la pestaña de Mesas.
+								</Alert>
+							) : (
+								mesasCompatibles.map((m) => (
+									<ListItem disableGutters key={m.id}>
+										<ListItemButton
+											onClick={() => confirmAprobar(m.id)}
+											sx={{ border: "1px solid #eee", borderRadius: 1, mb: 1 }}
+										>
+											<ListItemText
+												primary={`${formatDate(m.fecha)} - ${m.hora_desde || ""}`}
+												secondary={`Aula: ${m.aula || "N/A"} | Modalidad: ${m.modalidad === "REG" ? "Regular" : "Libre"}`}
+											/>
+										</ListItemButton>
+									</ListItem>
+								))
+							)}
+						</List>
+					)}
+				</DialogContent>
+				<DialogActions>
+					<Button onClick={() => setOpenDialog(false)}>Cancelar</Button>
+				</DialogActions>
+			</Dialog>
+
+			<Dialog
+				open={openCreateMesaDialog}
+				onClose={() => setOpenCreateMesaDialog(false)}
+				maxWidth="md"
+				fullWidth
+			>
+				<DialogTitle sx={{ fontWeight: 700 }}>
+					Crear Nueva Mesa y Agrupar Alumnos
+				</DialogTitle>
+				<DialogContent dividers>
+					<Alert severity="info" sx={{ mb: 3 }}>
+						Se creará una mesa extraordinaria para{" "}
+						<b>{selectedSolicitud?.materia_nombre}</b> (
+						{selectedSolicitud?.modalidad === "REG" ? "Regular" : "Libre"}) y se
+						vincularán <b>automáticamente</b> todos los alumnos con pedidos
+						pendientes para esta misma materia y condición.
+					</Alert>
+
+					<Grid container spacing={2}>
+						<Grid item xs={12} sm={6}>
+							<TextField
+								fullWidth
+								label="Fecha"
+								type="date"
+								InputLabelProps={{ shrink: true }}
+								value={createMesaData.fecha}
+								onChange={(e) =>
+									setCreateMesaData({
+										...createMesaData,
+										fecha: e.target.value,
+									})
+								}
+							/>
+						</Grid>
+						<Grid item xs={12} sm={4}>
+							<TextField
+								fullWidth
+								label="Hora"
+								type="time"
+								InputLabelProps={{ shrink: true }}
+								value={createMesaData.hora_desde}
+								onChange={(e) =>
+									setCreateMesaData({
+										...createMesaData,
+										hora_desde: e.target.value,
+									})
+								}
+							/>
+						</Grid>
+						<Grid item xs={12} sm={2}>
+							<TextField
+								fullWidth
+								label="N° Mesa"
+								type="number"
+								size="small"
+								InputLabelProps={{ shrink: true }}
+								value={createMesaData.numero_mesa}
+								onChange={(e) =>
+									setCreateMesaData({
+										...createMesaData,
+										numero_mesa: e.target.value,
+									})
+								}
+							/>
+						</Grid>
+
+						<Grid item xs={12}>
+							<Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 700 }}>
+								Tribunal Evaluador
+							</Typography>
+						</Grid>
+
+						<Grid item xs={12} sm={4}>
+							<FormControl fullWidth size="small">
+								<InputLabel>Presidente</InputLabel>
+								<Select
+									label="Presidente"
+									value={createMesaData.docente_presidente_id}
+									onChange={(e) =>
+										setCreateMesaData({
+											...createMesaData,
+											docente_presidente_id: e.target.value,
+										})
+									}
+								>
+									{docentes.map((d) => (
+										<MenuItem key={d.id} value={d.id}>
+											{d.apellido}, {d.nombre}
+										</MenuItem>
+									))}
+								</Select>
+							</FormControl>
+						</Grid>
+
+						<Grid item xs={12} sm={4}>
+							<FormControl fullWidth size="small">
+								<InputLabel>Vocal 1</InputLabel>
+								<Select
+									label="Vocal 1"
+									value={createMesaData.docente_vocal1_id}
+									onChange={(e) =>
+										setCreateMesaData({
+											...createMesaData,
+											docente_vocal1_id: e.target.value,
+										})
+									}
+								>
+									<MenuItem value="">
+										<em>Ninguno</em>
+									</MenuItem>
+									{docentes.map((d) => (
+										<MenuItem key={d.id} value={d.id}>
+											{d.apellido}, {d.nombre}
+										</MenuItem>
+									))}
+								</Select>
+							</FormControl>
+						</Grid>
+
+						<Grid item xs={12} sm={4}>
+							<FormControl fullWidth size="small">
+								<InputLabel>Vocal 2</InputLabel>
+								<Select
+									label="Vocal 2"
+									value={createMesaData.docente_vocal2_id}
+									onChange={(e) =>
+										setCreateMesaData({
+											...createMesaData,
+											docente_vocal2_id: e.target.value,
+										})
+									}
+								>
+									<MenuItem value="">
+										<em>Ninguno</em>
+									</MenuItem>
+									{docentes.map((d) => (
+										<MenuItem key={d.id} value={d.id}>
+											{d.apellido}, {d.nombre}
+										</MenuItem>
+									))}
+								</Select>
+							</FormControl>
+						</Grid>
+
+						<Grid item xs={12} sm={8}>
+							<TextField
+								fullWidth
+								label="Aula / Espacio"
+								size="small"
+								value={createMesaData.aula}
+								onChange={(e) =>
+									setCreateMesaData({ ...createMesaData, aula: e.target.value })
+								}
+							/>
+						</Grid>
+						<Grid item xs={12} sm={4}>
+							<TextField
+								fullWidth
+								label="Cupo"
+								type="number"
+								size="small"
+								value={createMesaData.cupo}
+								onChange={(e) =>
+									setCreateMesaData({
+										...createMesaData,
+										cupo: parseInt(e.target.value),
+									})
+								}
+							/>
+						</Grid>
+					</Grid>
+				</DialogContent>
+				<DialogActions>
+					<Button onClick={() => setOpenCreateMesaDialog(false)}>
+						Cancelar
+					</Button>
+					<Button
+						onClick={handleConfirmCreateMesa}
+						variant="contained"
+						color="primary"
+					>
+						Crear Mesa y Vincular Alumnos
+					</Button>
+				</DialogActions>
+			</Dialog>
+
+			<Dialog
+				open={openEditMesaDialog}
+				onClose={() => setOpenEditMesaDialog(false)}
+				maxWidth="md"
+				fullWidth
+			>
+				<DialogTitle sx={{ fontWeight: 700 }}>Editar Mesa Aprobada</DialogTitle>
+				<DialogContent dividers>
+					<Grid container spacing={2}>
+						<Grid item xs={12} sm={6}>
+							<TextField
+								fullWidth
+								label="Fecha"
+								type="date"
+								InputLabelProps={{ shrink: true }}
+								value={editMesaData.fecha}
+								onChange={(e) =>
+									setEditMesaData({ ...editMesaData, fecha: e.target.value })
+								}
+							/>
+						</Grid>
+						<Grid item xs={12} sm={4}>
+							<TextField
+								fullWidth
+								label="Hora"
+								type="time"
+								InputLabelProps={{ shrink: true }}
+								value={editMesaData.hora_desde}
+								onChange={(e) =>
+									setEditMesaData({
+										...editMesaData,
+										hora_desde: e.target.value,
+									})
+								}
+							/>
+						</Grid>
+						<Grid item xs={12} sm={2}>
+							<TextField
+								fullWidth
+								label="N° Mesa"
+								type="number"
+								size="small"
+								InputLabelProps={{ shrink: true }}
+								value={editMesaData.numero_mesa}
+								onChange={(e) =>
+									setEditMesaData({
+										...editMesaData,
+										numero_mesa: e.target.value,
+									})
+								}
+							/>
+						</Grid>
+						<Grid item xs={12}>
+							<Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 700 }}>
+								Tribunal Evaluador
+							</Typography>
+						</Grid>
+						<Grid item xs={12} sm={4}>
+							<FormControl fullWidth size="small">
+								<InputLabel>Presidente</InputLabel>
+								<Select
+									label="Presidente"
+									value={editMesaData.docente_presidente_id}
+									onChange={(e) =>
+										setEditMesaData({
+											...editMesaData,
+											docente_presidente_id: e.target.value,
+										})
+									}
+								>
+									<MenuItem value="">
+										<em>Ninguno</em>
+									</MenuItem>
+									{docentes.map((d) => (
+										<MenuItem key={d.id} value={d.id}>
+											{d.apellido}, {d.nombre}
+										</MenuItem>
+									))}
+								</Select>
+							</FormControl>
+						</Grid>
+						<Grid item xs={12} sm={4}>
+							<FormControl fullWidth size="small">
+								<InputLabel>Vocal 1</InputLabel>
+								<Select
+									label="Vocal 1"
+									value={editMesaData.docente_vocal1_id}
+									onChange={(e) =>
+										setEditMesaData({
+											...editMesaData,
+											docente_vocal1_id: e.target.value,
+										})
+									}
+								>
+									<MenuItem value="">
+										<em>Ninguno</em>
+									</MenuItem>
+									{docentes.map((d) => (
+										<MenuItem key={d.id} value={d.id}>
+											{d.apellido}, {d.nombre}
+										</MenuItem>
+									))}
+								</Select>
+							</FormControl>
+						</Grid>
+						<Grid item xs={12} sm={4}>
+							<FormControl fullWidth size="small">
+								<InputLabel>Vocal 2</InputLabel>
+								<Select
+									label="Vocal 2"
+									value={editMesaData.docente_vocal2_id}
+									onChange={(e) =>
+										setEditMesaData({
+											...editMesaData,
+											docente_vocal2_id: e.target.value,
+										})
+									}
+								>
+									<MenuItem value="">
+										<em>Ninguno</em>
+									</MenuItem>
+									{docentes.map((d) => (
+										<MenuItem key={d.id} value={d.id}>
+											{d.apellido}, {d.nombre}
+										</MenuItem>
+									))}
+								</Select>
+							</FormControl>
+						</Grid>
+						<Grid item xs={12} sm={8}>
+							<TextField
+								fullWidth
+								label="Aula / Espacio"
+								size="small"
+								value={editMesaData.aula}
+								onChange={(e) =>
+									setEditMesaData({ ...editMesaData, aula: e.target.value })
+								}
+							/>
+						</Grid>
+						<Grid item xs={12} sm={4}>
+							<TextField
+								fullWidth
+								label="Cupo"
+								type="number"
+								size="small"
+								value={editMesaData.cupo}
+								onChange={(e) =>
+									setEditMesaData({
+										...editMesaData,
+										cupo: parseInt(e.target.value),
+									})
+								}
+							/>
+						</Grid>
+					</Grid>
+				</DialogContent>
+				<DialogActions>
+					<Button onClick={() => setOpenEditMesaDialog(false)}>Cancelar</Button>
+					<Button
+						onClick={handleConfirmEditMesa}
+						variant="contained"
+						color="warning"
+					>
+						Guardar Cambios
+					</Button>
+				</DialogActions>
+			</Dialog>
+		</Box>
+	);
+};

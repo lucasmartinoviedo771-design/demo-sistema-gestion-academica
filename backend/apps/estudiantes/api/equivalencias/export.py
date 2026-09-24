@@ -1,0 +1,457 @@
+"""Endpoints de exportación (CSV y PDF nota) para equivalencias."""
+
+import csv
+
+from django.http import HttpResponse
+from django.utils import timezone
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+from apps.common.api_schemas import ApiResponse
+from apps.estudiantes.api.common import (
+    MONTH_NAMES,
+    build_certificate_header,
+    can_manage_equivalencias,
+)
+from apps.estudiantes.api.equivalencias.helpers import (
+    _serialize_pedido_equivalencia,
+)
+from apps.estudiantes.api.equivalencias.pdf_helpers import (
+    _build_equivalencia_paragraphs_externas,
+    _build_equivalencia_paragraphs_internas,
+    _build_equivalencia_signature,
+    _build_equivalencias_table,
+)
+from apps.estudiantes.api.router import estudiantes_router
+from apps.estudiantes.schemas import EquivalenciaItem, Horario
+from apps.estudiantes.schemas.inscripciones import ComisionResumen
+from core.auth_ninja import JWTAuth
+from core.models import (
+    EquivalenciaCurricular,
+    HorarioCatedra,
+    HorarioCatedraDetalle,
+    Materia,
+    PedidoEquivalencia,
+)
+from core.permissions import can, require
+
+
+@estudiantes_router.get("/equivalencias", response=list[EquivalenciaItem], auth=JWTAuth())
+def equivalencias_para_materia(request, materia_id: int):
+    """Devuelve materias equivalentes (otros profesorados) para la materia indicada."""
+    try:
+        m = Materia.objects.select_related("plan_de_estudio__profesorado").get(id=materia_id)
+    except Materia.DoesNotExist:
+        return []
+
+    # REGLA: Solo materias de Formación General o EDI
+    is_edi = "EDI" in m.nombre.upper()
+    if m.tipo_formacion != Materia.TipoFormacion.FORMACION_GENERAL and not is_edi:
+        return []
+
+    materias_equivalentes = []
+
+    if is_edi:
+        # Requerimiento: Si es un EDI, CUALQUIER otro EDI es una alternativa válida
+        # Saltamos la validación de grupos y buscamos en toda la base.
+        candidates = Materia.objects.select_related("plan_de_estudio__profesorado").filter(
+            nombre__icontains="EDI",
+        )
+        materias_equivalentes = list(candidates)
+    else:
+        # Buscamos en grupos de equivalencia formales
+        grupos = EquivalenciaCurricular.objects.filter(materias=m)
+        if grupos.exists():
+            for g in grupos:
+                # Filtramos candidatos por Reglas: FGN, misma carga horaria y mismo formato
+                candidates = g.materias.select_related("plan_de_estudio__profesorado").filter(
+                    tipo_formacion=m.tipo_formacion
+                )
+
+                # Si NO es EDI, aplicamos reglas estrictas
+                if not is_edi:
+                    candidates = candidates.filter(
+                        horas_semana=m.horas_semana,
+                        formato=m.formato,
+                    )
+
+                candidates = candidates.exclude(id=m.id)
+                for mm in candidates:
+                    materias_equivalentes.append(mm)
+        else:
+            # Fallback: buscar materias con el mismo nombre, mismo tipo de formación
+            # Nota: NO excluimos la materia original (m.id) para que el frontend pueda ofrecer cambios
+            # a otras comisiones dentro de la MISMA materia y profesorado.
+            candidates = Materia.objects.select_related("plan_de_estudio__profesorado").filter(
+                nombre__iexact=m.nombre,
+                tipo_formacion=m.tipo_formacion,
+            )
+
+            # Si NO es EDI, aplicamos reglas estrictas
+            candidates = candidates.filter(
+                horas_semana=m.horas_semana,
+                formato=m.formato,
+            )
+
+            materias_equivalentes = list(candidates)
+
+    # Si había grupos formales (if anterior) igual debemos asegurarnos de que m esté en la lista
+    if m not in materias_equivalentes:
+        materias_equivalentes.append(m)
+
+    def map_cuat(regimen: str) -> str:
+        return (
+            "ANUAL"
+            if regimen == Materia.TipoCursada.ANUAL
+            else ("1C" if regimen == Materia.TipoCursada.PRIMER_CUATRIMESTRE else "2C")
+        )
+
+    items: list[EquivalenciaItem] = []
+    for mm in materias_equivalentes:
+        # Evitamos Nones para el profesorado
+        profesorado_nombre = "Profesorado no especificado"
+        plan_id = None
+        profesorado_id = None
+        if mm.plan_de_estudio:
+            plan_id = mm.plan_de_estudio.id
+            if mm.plan_de_estudio.profesorado:
+                profesorado_nombre = mm.plan_de_estudio.profesorado.nombre
+                profesorado_id = mm.plan_de_estudio.profesorado.id
+
+        detalles = HorarioCatedraDetalle.objects.filter(horario_catedra__espacio=mm).select_related(
+            "bloque", "horario_catedra"
+        )
+        hs = [
+            Horario(
+                dia=d.bloque.get_dia_display(),
+                desde=str(d.bloque.hora_desde)[:5],
+                hasta=str(d.bloque.hora_hasta)[:5],
+            )
+            for d in detalles
+        ]
+
+        # Obtener comisiones (clases) de esta materia
+        from core.models import Comision
+
+        comisiones = (
+            Comision.objects.filter(materia=mm, estado=Comision.Estado.ABIERTA)
+            .select_related("turno", "docente")
+            .order_by("codigo")
+        )
+
+        comisiones_list = []
+        for comision in comisiones:
+            # Obtener horarios de esta comisión
+            # Los horarios están vinculados a través de HorarioCatedra que tiene FK a Materia y Turno
+            com_hs = []
+            if comision.horario:
+                # Si la comisión tiene horario asignado, usarlo
+                com_detalles = HorarioCatedraDetalle.objects.filter(horario_catedra=comision.horario).select_related(
+                    "bloque"
+                )
+                com_hs = [
+                    Horario(
+                        dia=d.bloque.get_dia_display(),
+                        desde=str(d.bloque.hora_desde)[:5],
+                        hasta=str(d.bloque.hora_hasta)[:5],
+                    )
+                    for d in com_detalles
+                ]
+            else:
+                # Si no, buscar los horarios de la materia que correspondan al turno de la comisión
+                hc = HorarioCatedra.objects.filter(espacio=mm, turno=comision.turno).first()
+                if hc:
+                    com_detalles = HorarioCatedraDetalle.objects.filter(horario_catedra=hc).select_related("bloque")
+                    com_hs = [
+                        Horario(
+                            dia=d.bloque.get_dia_display(),
+                            desde=str(d.bloque.hora_desde)[:5],
+                            hasta=str(d.bloque.hora_hasta)[:5],
+                        )
+                        for d in com_detalles
+                    ]
+
+            # Crear ComisionResumen
+            comisiones_list.append(
+                ComisionResumen(
+                    id=comision.id,
+                    codigo=comision.codigo,
+                    anio_lectivo=comision.anio_lectivo,
+                    turno_id=comision.turno_id,
+                    turno=comision.turno.nombre if comision.turno else "Turno no especificado",
+                    materia_id=comision.materia_id,
+                    materia_nombre=comision.materia.nombre,
+                    plan_id=plan_id,
+                    profesorado_id=profesorado_id,
+                    profesorado_nombre=profesorado_nombre,
+                    docente=comision.docente.persona.nombre if comision.docente and comision.docente.persona else None,
+                    cupo_maximo=None,  # Si existe este campo
+                    estado=comision.estado,
+                    horarios=com_hs,
+                )
+            )
+
+        items.append(
+            EquivalenciaItem(
+                materia_id=mm.id,
+                materia_nombre=mm.nombre,
+                plan_id=plan_id,
+                profesorado_id=profesorado_id,
+                profesorado=profesorado_nombre,
+                anio=mm.anio_cursada,
+                cuatrimestre=map_cuat(mm.regimen),
+                horarios=hs,
+                comisiones=comisiones_list,
+            )
+        )
+    return items
+
+
+@estudiantes_router.post("/equivalencias/pedidos/{pedido_id}/nota", auth=JWTAuth())
+def generar_nota_equivalencias(request, pedido_id: int):
+    pedido = (
+        PedidoEquivalencia.objects.select_related(
+            "estudiante__user",
+            "ventana",
+            "profesorado_destino",
+        )
+        .prefetch_related("materias")
+        .filter(id=pedido_id)
+        .first()
+    )
+    if not pedido:
+        return 404, ApiResponse(ok=False, message="No se encontró el pedido.")
+
+    if not can_manage_equivalencias(request.user):
+        estudiante = getattr(request.user, "estudiante", None)
+        if not estudiante or estudiante.id != pedido.estudiante_id:
+            return 403, ApiResponse(ok=False, message="No tiene permisos para ver este pedido.")
+
+    if not pedido.materias.exists():
+        return 400, ApiResponse(ok=False, message="El pedido no tiene materias cargadas.")
+
+    today = timezone.now()
+    est = pedido.estudiante
+    destino_nombre = pedido.profesorado_destino_nombre or (
+        pedido.profesorado_destino.nombre if pedido.profesorado_destino_id else ""
+    )
+    ciclo_lectivo = pedido.ciclo_lectivo or str(today.year)
+    tipo = pedido.tipo
+    anexo_label = "ANEXO FORMULARIO A" if tipo == PedidoEquivalencia.Tipo.ANEXO_A else "ANEXO FORMULARIO B"
+    note_title = (
+        "Nota para solicitar equivalencias internas"
+        if tipo == PedidoEquivalencia.Tipo.ANEXO_A
+        else "Modelo de nota para solicitud de equivalencias"
+    )
+    if tipo == PedidoEquivalencia.Tipo.ANEXO_A:
+        paragraphs = _build_equivalencia_paragraphs_internas(
+            destino_nombre,
+            pedido.profesorado_origen_nombre,
+            pedido.plan_origen_resolucion,
+            ciclo_lectivo,
+        )
+    else:
+        paragraphs = _build_equivalencia_paragraphs_externas(
+            destino_nombre,
+            pedido.establecimiento_origen,
+            pedido.establecimiento_localidad,
+            pedido.establecimiento_provincia,
+            pedido.plan_destino_resolucion,
+            ciclo_lectivo,
+        )
+
+    materias_rows = [
+        {"nombre": m.nombre, "formato": m.formato, "anio": m.anio_cursada, "nota": m.nota}
+        for m in pedido.materias.all()
+    ]
+
+    response = HttpResponse(content_type="application/pdf")
+    response["Content-Disposition"] = f'attachment; filename="pedido_equivalencias_{est.dni}.pdf"'
+    doc = SimpleDocTemplate(
+        response,
+        pagesize=A4,
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=40,
+        bottomMargin=40,
+    )
+
+    styles = getSampleStyleSheet()
+    anexo_style = ParagraphStyle(
+        "EquivalenciaAnexo",
+        parent=styles["Normal"],
+        alignment=TA_RIGHT,
+        fontSize=10,
+        textColor=colors.grey,
+        spaceAfter=4,
+    )
+    title_style = ParagraphStyle(
+        "EquivalenciaTitle",
+        parent=styles["Heading2"],
+        alignment=TA_CENTER,
+        fontSize=15,
+        leading=18,
+        spaceAfter=16,
+    )
+    body_style = ParagraphStyle(
+        "EquivalenciaBody",
+        parent=styles["Normal"],
+        alignment=TA_JUSTIFY,
+        fontSize=12,
+        leading=16,
+        firstLineIndent=28,
+        spaceAfter=12,
+    )
+    plain_body = ParagraphStyle(
+        "EquivalenciaBodyPlain",
+        parent=body_style,
+        firstLineIndent=0,
+    )
+    helper_style = ParagraphStyle(
+        "EquivalenciaHelper",
+        parent=styles["Normal"],
+        fontSize=9,
+        leading=12,
+        alignment=TA_JUSTIFY,
+        textColor=colors.grey,
+        spaceAfter=10,
+    )
+    location_style = ParagraphStyle(
+        "EquivalenciaLocation",
+        parent=styles["Normal"],
+        alignment=TA_RIGHT,
+        fontSize=11,
+        leading=14,
+        spaceAfter=18,
+    )
+    motto_style = ParagraphStyle(
+        "EquivalenciaMotto",
+        parent=styles["Normal"],
+        alignment=TA_CENTER,
+        fontSize=8,
+        leading=10,
+        textColor=colors.grey,
+    )
+
+    mes_nombre = MONTH_NAMES.get(today.month, today.strftime("%B").lower())
+    fecha_linea = f"Río Grande, {today.day} de {mes_nombre} de {today.year}"
+
+    story: list = []
+    story.extend(build_certificate_header(doc))
+    story.append(Paragraph(anexo_label, anexo_style))
+    story.append(Paragraph(note_title, title_style))
+    story.append(Paragraph(fecha_linea, location_style))
+    for texto in paragraphs:
+        story.append(Paragraph(texto, body_style))
+    story.append(Paragraph("Las materias que solicito se detallen son:", plain_body))
+    story.append(Spacer(1, 8))
+    story.append(_build_equivalencias_table(materias_rows))
+    story.append(Spacer(1, 6))
+    story.append(
+        Paragraph(
+            "Indique el nombre del espacio curricular tal cual figura en su analítico, "
+            "el formato (módulo, asignatura, taller, etc.) y el año de cursada.",
+            helper_style,
+        )
+    )
+    story.append(Paragraph("Sin otro particular, saludo atentamente.", body_style))
+    story.append(Spacer(1, 20))
+    story.append(_build_equivalencia_signature(est))
+    story.append(Spacer(1, 14))
+    story.append(
+        Paragraph(
+            "Las Islas Malvinas, Georgia, Sandwich del Sur y los Hielos Continentales, son y serán Argentinas",
+            motto_style,
+        )
+    )
+
+    doc.build(story)
+
+    return response
+
+
+@estudiantes_router.get("/equivalencias/export", auth=JWTAuth())
+def exportar_pedidos_equivalencia(
+    request,
+    profesorado_id: int | None = None,
+    ventana_id: int | None = None,
+    estado: str | None = None,
+):
+    if not can_manage_equivalencias(request.user):
+        require(request.user, "gestionar_equivalencias")
+    qs = (
+        PedidoEquivalencia.objects.select_related(
+            "profesorado_destino",
+            "ventana",
+            "estudiante__user",
+        )
+        .prefetch_related("materias")
+        .order_by("profesorado_destino_nombre", "estudiante__persona__dni")
+    )
+    if profesorado_id:
+        qs = qs.filter(profesorado_destino_id=profesorado_id)
+    if ventana_id:
+        qs = qs.filter(ventana_id=ventana_id)
+    if estado:
+        qs = qs.filter(estado=estado.lower())
+
+    from apps.common.security_utils import sanitize_row
+
+    response = HttpResponse(content_type="text/csv")
+    response["Content-Disposition"] = 'attachment; filename="pedidos_equivalencias.csv"'
+    writer = csv.writer(response)
+    writer.writerow(
+        [
+            "DNI",
+            "Estudiante",
+            "Tipo",
+            "Estado",
+            "Profesorado destino",
+            "Plan destino",
+            "Ciclo lectivo",
+            "Ventana",
+            "Fecha actualización",
+            "Materias solicitadas (incluye nota)",
+        ]
+    )
+    for pedido in qs:
+        materias_txt = " | ".join(
+            " ".join(
+                filter(
+                    None,
+                    [
+                        m.nombre,
+                        f"({m.formato})" if m.formato else None,
+                        f"Año {m.anio_cursada}" if m.anio_cursada else None,
+                        f"Nota: {m.nota}" if getattr(m, "nota", "") else None,
+                    ],
+                )
+            )
+            for m in pedido.materias.all()
+        )
+        ventana_label = ""
+        if pedido.ventana_id:
+            desde = pedido.ventana.desde.strftime("%d/%m/%Y") if pedido.ventana.desde else ""
+            hasta = pedido.ventana.hasta.strftime("%d/%m/%Y") if pedido.ventana.hasta else ""
+            ventana_label = f"{desde} - {hasta}"
+        writer.writerow(
+            sanitize_row(
+                [
+                    pedido.estudiante.dni,
+                    pedido.estudiante.user.get_full_name() if pedido.estudiante.user_id else "",
+                    pedido.get_tipo_display(),
+                    pedido.get_estado_display(),
+                    pedido.profesorado_destino_nombre,
+                    pedido.plan_destino_resolucion,
+                    pedido.ciclo_lectivo,
+                    ventana_label,
+                    pedido.updated_at.strftime("%d/%m/%Y %H:%M"),
+                    materias_txt,
+                ]
+            )
+        )
+
+    return response

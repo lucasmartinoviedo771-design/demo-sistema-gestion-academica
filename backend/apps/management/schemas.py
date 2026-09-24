@@ -1,0 +1,228 @@
+from datetime import date, datetime
+
+from ninja import Field, Schema
+
+
+class MesaDocenteOut(Schema):
+    rol: str
+    docente_id: int | None = None
+    nombre: str | None = None
+    dni: str | None = None
+
+
+class MesaIn(Schema):
+    materia_id: int
+    tipo: str
+    modalidad: str = "REGULAR"
+    fecha: date
+    hora_desde: str | None = None
+    hora_hasta: str | None = None
+    aula: str | None = None
+    cupo: int | None = 0
+    ventana_id: int | None = None
+    docente_presidente_id: int | None = None
+    docente_vocal1_id: int | None = None
+    docente_vocal2_id: int | None = None
+    numero_mesa: int | None = None
+    estudiante_exclusivo_dni: str | None = None
+
+
+class CrearMesaDesdeSolicitudIn(Schema):
+    solicitud_id: int
+    fecha: date
+    hora_desde: str | None = None
+    hora_hasta: str | None = None
+    aula: str | None = None
+    cupo: int | None = 0
+    docente_presidente_id: int | None = None
+    docente_vocal1_id: int | None = None
+    docente_vocal2_id: int | None = None
+    numero_mesa: int | None = None
+
+
+class MesaOut(Schema):
+    id: int
+    materia_id: int
+    materia_nombre: str
+    profesorado_id: int | None = None
+    profesorado_nombre: str | None = None
+    plan_id: int | None = None
+    plan_resolucion: str | None = None
+    anio_cursada: int | None = None
+    regimen: str | None = None
+    tipo: str
+    modalidad: str
+    fecha: date
+    hora_desde: str | None
+    hora_hasta: str | None
+    aula: str | None
+    cupo: int
+    codigo: str | None = None
+    numero_mesa: int | None = None
+    docentes: list[MesaDocenteOut] = Field(default_factory=list)
+    esta_cerrada: bool = False
+    inscriptos_count: int = 0
+    estudiante_exclusivo_dni: str | None = None
+    estudiante_exclusivo_nombre: str | None = None
+    mi_rol: str | None = None
+    puede_editar: bool = True
+    acta_id: int | None = None
+
+
+class SolicitudMesaOut(Schema):
+    id: int
+    estudiante_id: int
+    estudiante_nombre: str
+    estudiante_dni: str
+    materia_id: int
+    materia_nombre: str
+    materia_anio: int | None = None
+    profesorado_nombre: str | None = None
+    ventana_id: int
+    estado: str
+    estado_display: str
+    fecha_solicitud: datetime
+    modalidad: str | None = None
+    modalidad_display: str | None = None
+    observaciones: str | None = None
+    mesa_asignada_id: int | None = None
+    fecha_mesa: date | None = None
+    hora_mesa: str | None = None
+    aula_mesa: str | None = None
+    numero_mesa: int | None = None
+    tribunal_presidente: str | None = None
+    tribunal_vocal1: str | None = None
+    tribunal_vocal2: str | None = None
+    docente_nombre: str | None = None
+
+
+class VentanaIn(Schema):
+    tipo: str
+    desde: date
+    hasta: date
+    activo: bool = True
+    permite_libres: bool = False
+    periodo: str | None = None
+
+
+class VentanaOut(Schema):
+    id: int
+    tipo: str
+    desde: date
+    hasta: date
+    activo: bool
+    permite_libres: bool = False
+    periodo: str | None = None
+
+
+class DashboardCatedra(Schema):
+    id: int
+    materia: str
+    profesorado: str
+    anio_lectivo: int
+    turno: str | None
+
+
+class DashboardDocente(Schema):
+    id: int
+    nombre: str
+    documento: str
+    total_catedras: int
+    catedras: list[DashboardCatedra]
+
+
+class DashboardProfesorado(Schema):
+    id: int
+    nombre: str
+    planes: int
+    materias: int
+    correlativas: int
+
+
+class DashboardPreinsEstado(Schema):
+    estado: str
+    total: int
+
+
+class DashboardPreinsDetalle(Schema):
+    id: int
+    codigo: str
+    estudiante: str
+    carrera: str | None
+    fecha: datetime | None
+
+
+class DashboardPreinscripciones(Schema):
+    total: int
+    por_estado: list[DashboardPreinsEstado]
+    recientes: list[DashboardPreinsDetalle]
+
+
+class DashboardMesaTipo(Schema):
+    tipo: str
+    total: int
+
+
+class DashboardMesas(Schema):
+    total: int
+    por_tipo: list[DashboardMesaTipo]
+
+
+class DashboardRegularidad(Schema):
+    id: int
+    estudiante: str
+    dni: str
+    materia: str
+    profesorado: str | None
+    situacion: str
+    nota: str | None
+    fecha: date | datetime | str
+
+
+class DashboardVentana(Schema):
+    id: int
+    tipo: str
+    desde: date | datetime | str
+    hasta: date | datetime | str
+    activo: bool
+    estado: str
+
+
+class DashboardPedidoAnalitico(Schema):
+    id: int
+    estudiante: str
+    dni: str
+    fecha: date | datetime | str
+    motivo: str
+    profesorado: str | None
+
+
+class DashboardCambioComision(Schema):
+    id: int
+    estudiante: str
+    dni: str
+    materia: str
+    profesorado: str | None
+    comision_actual: str | None
+    comision_solicitada: str | None
+    estado: str
+    actualizado: date | datetime | str
+
+
+class DashboardHorario(Schema):
+    profesorado_id: int
+    profesorado: str
+    anio_cursada: int
+    cantidad: int
+
+
+class GlobalOverviewOut(Schema):
+    docentes: list[DashboardDocente]
+    profesorados: list[DashboardProfesorado]
+    preinscripciones: DashboardPreinscripciones
+    horarios: list[DashboardHorario]
+    pedidos_comision: list[DashboardCambioComision]
+    pedidos_analiticos: list[DashboardPedidoAnalitico]
+    mesas: DashboardMesas
+    regularidades: list[DashboardRegularidad]
+    ventanas: list[DashboardVentana]

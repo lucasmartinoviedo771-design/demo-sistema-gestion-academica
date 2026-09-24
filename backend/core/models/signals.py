@@ -1,0 +1,93 @@
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+from .base import Persona
+
+
+@receiver(post_save, sender=Persona)
+def sync_user_from_persona(sender, instance, **kwargs):
+    """
+    Sincroniza el username en el modelo User cuando cambia el DNI de la Persona.
+    """
+    user = None
+    # 1. Intentar por UserProfile (Administrativos/Docentes con login)
+    if hasattr(instance, "user_profile"):
+        user = instance.user_profile.user
+    # 2. Intentar por Estudiante (Alumnos)
+    elif hasattr(instance, "estudiante_perfil"):
+        user = instance.estudiante_perfil.user
+
+    if user:
+        update_fields = []
+
+        # Sincronizar Username (DNI)
+        if user.username != instance.dni:
+            user.username = instance.dni
+            update_fields.append("username")
+
+        # Sincronizar Email para permitir Login con Google
+        if (user.email or "") != (instance.email or ""):
+            user.email = instance.email or ""
+            update_fields.append("email")
+
+        if update_fields:
+            user.save(update_fields=update_fields)
+
+
+from .estudiantes import Estudiante
+from .preinscripciones import PreinscripcionChecklist
+
+
+@receiver(post_save, sender=PreinscripcionChecklist)
+def sync_estudiante_from_checklist(sender, instance, **kwargs):
+    """
+    Sincroniza los flags de documentación al modelo Estudiante
+    cuando se actualiza el checklist de una preinscripción.
+    """
+    estudiante = instance.preinscripcion.alumno
+    fields_to_sync = [
+        "dni_legalizado",
+        "fotos_4x4",
+        "certificado_salud",
+        "folios_oficio",
+        "titulo_secundario_legalizado",
+        "certificado_titulo_en_tramite",
+        "analitico_legalizado",
+        "articulo_7",
+        "adeuda_materias",
+        "adeuda_materias_detalle",
+        "escuela_secundaria",
+        "certificado_alumno_regular_sec",
+        "es_certificacion_docente",
+        "titulo_terciario_univ",
+        "incumbencia",
+        "curso_introductorio_aprobado",
+    ]
+
+    updated = False
+    for field in fields_to_sync:
+        if hasattr(estudiante, field):
+            val_cl = getattr(instance, field)
+            val_est = getattr(estudiante, field)
+            if val_cl != val_est:
+                setattr(estudiante, field, val_cl)
+                updated = True
+
+    if updated:
+        # Usamos una bandera para evitar recursión infinita
+        estudiante._syncing_from_cl = True
+        estudiante.save()
+
+
+@receiver(post_save, sender=Estudiante)
+def ensure_estudiante_group(sender, instance, created, **kwargs):
+    """
+    Garantiza que cualquier usuario vinculado a un perfil de Estudiante
+    tenga siempre asignado el grupo de Django 'estudiante'.
+    """
+    if instance.user_id:
+        from django.contrib.auth.models import Group
+
+        grupo = Group.objects.filter(name="estudiante").first()
+        if grupo and not instance.user.groups.filter(id=grupo.id).exists():
+            instance.user.groups.add(grupo)

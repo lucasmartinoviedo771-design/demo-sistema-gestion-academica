@@ -1,0 +1,413 @@
+import os
+from datetime import timedelta
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Needed by WeasyPrint on Windows to avoid GLib probing UWP handlers
+os.environ["GIO_USE_VFS"] = "local"
+os.environ.setdefault("GIO_USE_VOLUME_MONITOR", "local")
+
+# === Paths ==============================================================
+BASE_DIR = Path(__file__).resolve().parent.parent  # .../backend
+
+# === .env ==============================================================
+# Colocá el archivo .env en backend/.env (mismo nivel que manage.py)
+load_dotenv(BASE_DIR / ".env")
+
+RECAPTCHA_SECRET_KEY = os.getenv("RECAPTCHA_SECRET_KEY", "")
+RECAPTCHA_MIN_SCORE = float(os.getenv("RECAPTCHA_MIN_SCORE", "0.3"))
+PREINS_RATE_LIMIT_PER_HOUR = int(os.getenv("PREINS_RATE_LIMIT_PER_HOUR", "5"))
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "")
+
+# === Entorno ==============================================================
+DJANGO_ENV = os.getenv("DJANGO_ENV", "development").lower()
+IS_PROD = DJANGO_ENV == "production"
+
+
+# === Helpers para ENV ===================================================
+def env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).lower() in ("1", "true", "yes", "on")
+
+
+def env_list(name: str, default=None):
+    if default is None:
+        default = []
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+# === Seguridad / Debug ==================================================
+DEFAULT_DEBUG = not IS_PROD
+DEBUG = env_bool("DEBUG", DEFAULT_DEBUG)
+
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    if IS_PROD:
+        raise RuntimeError(
+            "SECRET_KEY no está configurada. "
+            "Define la variable de entorno SECRET_KEY con un valor seguro en producción."
+        )
+    # En desarrollo, forzamos que se defina algo, no dejamos un valor por defecto "famoso"
+    raise RuntimeError("SECRET_KEY no definida en el entorno (.env)")
+
+# Clave independiente para JWT (separación de privilegios)
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", SECRET_KEY)
+
+# Rate limiting para login (fall back sensato en desarrollo)
+LOGIN_RATE_LIMIT_ATTEMPTS = int(os.getenv("LOGIN_RATE_LIMIT_ATTEMPTS", "5"))
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("LOGIN_RATE_LIMIT_WINDOW_SECONDS", "300"))
+
+# Seguridad para Kioscos de Asistencia (dispositivos físicos)
+KIOSK_API_KEY = os.getenv("KIOSK_API_KEY")
+if not KIOSK_API_KEY:
+    if IS_PROD:
+        raise RuntimeError(
+            "KIOSK_API_KEY no está configurada. "
+            "Define la variable de entorno KIOSK_API_KEY con un valor seguro en producción."
+        )
+    KIOSK_API_KEY = "dev-kiosk-key-secure-123"
+
+# Hosts permitidos (¡ajusta con tu dominio real!)
+ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", ["localhost", "127.0.0.1", "[::1]"])
+CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", [])  # ej: http://localhost:5173, https://tu-dominio
+
+# Cookies seguras en prod
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+
+# === Apps ===============================================================
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "corsheaders",
+    "core",
+    "apps.carreras",
+    "apps.preinscriptions",
+    "apps.estudiantes",
+    "apps.guias",
+    "apps.asistencia",
+    "apps.metrics",
+]
+
+# Profiling con silk (debe estar protegido siempre)
+ENABLE_PROFILING = env_bool("ENABLE_PROFILING", default=DEBUG)
+if ENABLE_PROFILING:
+    INSTALLED_APPS.append("silk")
+    # VULN-001 FIX: Obligar a que el usuario esté autenticado y sea superuser
+    SILKY_AUTHENTICATION = True
+    SILKY_AUTHORISATION = True
+
+    def check_silk_access(user):
+        return user.is_authenticated and user.is_superuser
+
+    SILKY_PERMISSIONS = check_silk_access
+
+# === Middleware =========================================================
+MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "core.middleware.AuditRequestMiddleware",
+]
+
+# Profiling middleware
+if ENABLE_PROFILING:
+    MIDDLEWARE.insert(0, "silk.middleware.SilkyMiddleware")
+
+ROOT_URLCONF = "config.urls"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [BASE_DIR / "templates"],  # opcional
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = "config.wsgi.application"  # o ASGI si usás Daphne/Uvicorn
+
+# === Base de datos =============================================================
+DB_ENGINE = os.getenv("DB_ENGINE", "mysql").lower()
+
+if DB_ENGINE == "sqlite":
+    SQLITE_NAME = os.getenv("SQLITE_NAME", "db.sqlite3")
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / SQLITE_NAME,
+        }
+    }
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.mysql",
+            "NAME": os.getenv("DB_NAME", "ipes6"),
+            "USER": os.getenv("DB_USER", "ipes6_user"),  # PROD: usar usuario con privilegios mínimos, nunca root
+            "PASSWORD": os.getenv("DB_PASSWORD", ""),
+            "HOST": os.getenv("DB_HOST", "127.0.0.1"),
+            "PORT": os.getenv("DB_PORT", "3306"),
+            "OPTIONS": {"charset": "utf8mb4"},
+        }
+    }
+
+
+# === Internacionalización ==============================================
+LANGUAGE_CODE = "es-ar"
+TIME_ZONE = "America/Argentina/Buenos_Aires"
+USE_I18N = True
+# USE_TZ = False: datetimes naive en zona America/Argentina/Buenos_Aires.
+# Argentina no usa DST, por lo que el riesgo de inconsistencias es bajo.
+# Cambiar a True requeriría migrar todos los DateTimeField existentes.
+USE_TZ = False
+
+# === Archivos estáticos / media ========================================
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"  # para collectstatic en prod
+STATICFILES_DIRS = [BASE_DIR / "static"]  # opcional (para assets locales)
+
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"  # aquí se guardan las fotos/documentos
+
+# Límite de subida (10 MB de ejemplo)
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
+DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
+
+# === CORS ===============================================================
+
+
+# Si necesitás permitir todos los headers/metodos en dev:
+try:
+    from corsheaders.defaults import default_headers
+
+    CORS_ALLOW_HEADERS = list(default_headers)
+except ImportError:
+    CORS_ALLOW_HEADERS = [
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "content-type",
+        "origin",
+        "user-agent",
+        "x-csrftoken",
+        "x-requested-with",
+    ]
+CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+# --- fin CORS ---
+
+# === CORS (override with FRONTEND_ORIGINS) ==============================
+try:
+    from corsheaders.defaults import default_headers, default_methods
+except Exception:
+    default_headers, default_methods = (
+        (),
+        ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"),
+    )
+
+FRONTEND_ORIGINS = env_list(
+    "FRONTEND_ORIGINS",
+    [
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ],
+)
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+# === Email (recuperación de contraseña) ===
+# Sin EMAIL_HOST_USER configurado, se usa el backend de consola: los emails
+# se imprimen en el log del backend en vez de enviarse de verdad. Apenas se
+# tenga una casilla real, cargar las variables de entorno de abajo (nunca
+# hardcodear credenciales acá) y el envío empieza a funcionar sin tocar código.
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+if EMAIL_HOST_USER:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+    EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+    EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+    EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "true").lower() == "true"
+    EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+    DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER)
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+    DEFAULT_FROM_EMAIL = "no-reply@demo.invalid"
+
+# Ventana de validez del link de recuperación de contraseña.
+PASSWORD_RESET_TIMEOUT_MINUTES = int(os.getenv("PASSWORD_RESET_TIMEOUT_MINUTES", "30"))
+
+
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOWED_ORIGINS = FRONTEND_ORIGINS
+AUTH_PASSWORD_VALIDATORS = [
+    {
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": int(os.getenv("AUTH_PASSWORD_MIN_LENGTH", "8"))},
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
+    },
+]
+
+# === JWT Cookies ==========================================================
+JWT_ACCESS_COOKIE_NAME = "jwt_access_token"
+JWT_REFRESH_COOKIE_NAME = "jwt_refresh_token"
+JWT_COOKIE_PATH = "/"  # Ruta raíz para evitar conflictos de path
+JWT_COOKIE_DOMAIN = os.getenv("JWT_COOKIE_DOMAIN", None)  # Dominio de la cookie (ej: .tu-dominio.com)
+
+# Cookies/seguridad (ajustá para prod)
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+# Mantenemos el token CSRF en cookie para que el frontend pueda leerlo
+# y enviarlo en el encabezado X-CSRFToken.
+CSRF_USE_SESSIONS = False
+# CSRF_COOKIE_SECURE = True
+# SESSION_COOKIE_SECURE = True
+
+# === Seguridad en producción ============================================
+if IS_PROD:
+    # Confiar en el header de Cloudflare/Nginx para saber que es HTTPS
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+    # Redirección a HTTPS + HSTS
+    SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", True)
+    SECURE_HSTS_SECONDS = 31536000  # 1 año
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+
+    # Cookies seguras
+    # Cookies seguras (solo si usamos SSL)
+    # IMPORTANTE: SameSite='None' requiere Secure=True sí o sí.
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    # X-Frame, X-Content-Type, etc.
+    X_FRAME_OPTIONS = "DENY"
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = "same-origin"
+
+    # SameSite: 'Lax' es más seguro que 'None' y suficiente si están en subdominios
+    # o si se usa el proxy de Nginx adecuadamente.
+    SESSION_COOKIE_SAMESITE = "Lax"
+    CSRF_COOKIE_SAMESITE = "Lax"
+else:
+    # Desarrollo
+    SECURE_SSL_REDIRECT = False
+    SECURE_HSTS_SECONDS = 0
+    SESSION_COOKIE_SECURE = False
+    CSRF_COOKIE_SECURE = False
+    SESSION_COOKIE_SAMESITE = "Lax"
+    CSRF_COOKIE_SAMESITE = "Lax"
+    RECAPTCHA_MIN_SCORE = 0.3  # En dev permitimos un umbral más bajo para pruebas
+
+
+# === Logging Configuration ===================================================
+LOG_DIR = Path("/app/logs")
+if not LOG_DIR.exists() or not os.access(LOG_DIR, os.W_OK):
+    LOG_DIR = BASE_DIR / "logs"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "[{asctime}] {levelname} {name} (pid {process:d}): {message}",
+            "style": "{",
+        },
+        "simple": {
+            "format": "{levelname} {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "file": {
+            "level": "INFO",
+            "class": "logging.handlers.WatchedFileHandler",
+            "filename": str(LOG_DIR / "django.log"),
+            "formatter": "verbose",
+        },
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+        },
+    },
+    "loggers": {
+        "": {
+            "handlers": ["file", "console"] if not IS_PROD else ["file"],
+            "level": os.getenv("LOG_LEVEL", "INFO"),
+            "propagate": True,
+        },
+        "django": {
+            "handlers": ["file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}
+
+
+# --- Cache -------------------------------------------------------------------
+# Con REDIS_URL definido el cache es compartido por los workers de gunicorn y
+# admite borrado por patron. Sin la variable cae a LocMemCache, que funciona
+# pero vive dentro de cada worker: el sistema sigue andando, solo con menos
+# aciertos de cache. Ver apps/metrics/CACHE_STRATEGY.md.
+REDIS_URL = os.getenv("REDIS_URL", "")
+
+if REDIS_URL:
+    # django-redis y no el backend nativo de Django: hace falta delete_pattern()
+    # para invalidar por evento (ver apps/metrics/cache_invalidation.py). La API
+    # generica de cache de Django no expone borrado por patron porque no todos
+    # los backends pueden implementarlo de forma eficiente.
+    CACHES = {
+        "default": {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": "ipes6",
+            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "ipes6-analytics",
+        }
+    }
+
+
+# --- IP real del cliente -----------------------------------------------------
+# Posición de X-Forwarded-For a usar cuando NO llega CF-Connecting-IP. Con
+# Cloudflare adelante la IP del visitante queda primera (índice 0). Si algún día
+# se saca Cloudflare y queda un único nginx propio, el valor confiable pasa a ser
+# el último (-1), porque el primero lo puede escribir el cliente.
+# Ver core/client_ip.py.
+CLIENT_IP_XFF_INDEX = int(os.getenv("CLIENT_IP_XFF_INDEX", "0"))

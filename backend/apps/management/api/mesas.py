@@ -1,0 +1,573 @@
+from datetime import date, datetime
+
+from django.db import transaction
+from django.db.models import Count, Prefetch, Q
+from django.shortcuts import get_object_or_404
+from ninja.errors import HttpError
+
+from apps.common.audit import log_action_from_request, snapshot
+from apps.common.date_utils import calcular_limite_baja_mesa
+from core.auth_ninja import JWTAuth
+from core.models import AuditLog, Docente, Materia, MesaExamen, Profesorado, SolicitudMesa, VentanaHabilitacion
+from core.permissions import allowed_profesorados, ensure_profesorado_access, require
+
+from ..router import management_router
+from ..schemas import CrearMesaDesdeSolicitudIn, MesaDocenteOut, MesaIn, MesaOut, SolicitudMesaOut
+
+
+def _serialize_mesa(mesa: MesaExamen, docente_actual=None, is_docente_only: bool = False) -> MesaOut:
+    m = mesa.materia
+    p = m.plan_de_estudio
+    docentes = []
+    if mesa.docente_presidente:
+        docentes.append(
+            MesaDocenteOut(
+                rol="Presidente",
+                docente_id=mesa.docente_presidente_id,
+                nombre=f"{mesa.docente_presidente.persona.apellido}, {mesa.docente_presidente.persona.nombre}",
+                dni=mesa.docente_presidente.persona.dni,
+            )
+        )
+    if mesa.docente_vocal1:
+        docentes.append(
+            MesaDocenteOut(
+                rol="Vocal 1",
+                docente_id=mesa.docente_vocal1_id,
+                nombre=f"{mesa.docente_vocal1.persona.apellido}, {mesa.docente_vocal1.persona.nombre}",
+                dni=mesa.docente_vocal1.persona.dni,
+            )
+        )
+    if mesa.docente_vocal2:
+        docentes.append(
+            MesaDocenteOut(
+                rol="Vocal 2",
+                docente_id=mesa.docente_vocal2_id,
+                nombre=f"{mesa.docente_vocal2.persona.apellido}, {mesa.docente_vocal2.persona.nombre}",
+                dni=mesa.docente_vocal2.persona.dni,
+            )
+        )
+
+    mi_rol = None
+    if docente_actual:
+        if mesa.docente_presidente_id == docente_actual.id:
+            mi_rol = "Presidente"
+        elif mesa.docente_vocal1_id == docente_actual.id:
+            mi_rol = "Vocal 1"
+        elif mesa.docente_vocal2_id == docente_actual.id:
+            mi_rol = "Vocal 2"
+
+    hoy = date.today()
+    if is_docente_only:
+        # Para docentes: solo el presidente puede editar, y solo a partir del día de la mesa si no está cerrada
+        puede_editar = mi_rol == "Presidente" and mesa.fecha <= hoy and not bool(mesa.planilla_cerrada_en)
+    else:
+        # Administración / Secretaría
+        puede_editar = not bool(mesa.planilla_cerrada_en)
+
+    est_exc = mesa.estudiante_exclusivo
+    est_exc_persona = est_exc.persona if est_exc else None
+    acta_existente = next(iter(mesa.actas_cargadas.all()), None)
+    return MesaOut(
+        id=mesa.id,
+        materia_id=mesa.materia_id,
+        materia_nombre=m.nombre,
+        profesorado_id=p.profesorado_id if p else None,
+        profesorado_nombre=p.profesorado.nombre if p and p.profesorado else None,
+        plan_id=m.plan_de_estudio_id,
+        plan_resolucion=p.resolucion if p else None,
+        anio_cursada=m.anio_cursada,
+        regimen=m.regimen,
+        tipo=mesa.tipo,
+        modalidad=mesa.modalidad,
+        fecha=mesa.fecha,
+        hora_desde=str(mesa.hora_desde) if mesa.hora_desde else None,
+        hora_hasta=str(mesa.hora_hasta) if mesa.hora_hasta else None,
+        aula=mesa.aula,
+        cupo=mesa.cupo or 0,
+        codigo=mesa.codigo,
+        numero_mesa=mesa.numero_mesa,
+        docentes=docentes,
+        esta_cerrada=mesa.planilla_cerrada_en is not None,
+        inscriptos_count=getattr(mesa, "num_inscriptos", 0),
+        estudiante_exclusivo_dni=est_exc_persona.dni if est_exc_persona else None,
+        estudiante_exclusivo_nombre=f"{est_exc_persona.apellido}, {est_exc_persona.nombre}"
+        if est_exc_persona
+        else None,
+        mi_rol=mi_rol,
+        puede_editar=puede_editar,
+        acta_id=acta_existente.id if acta_existente else None,
+    )
+
+
+def _auto_cleanup_deserted_mesas(dias_gracia: int = 5):
+    """Delega al método del modelo para mantener la lógica centralizada."""
+    return MesaExamen.auto_cleanup_deserted_mesas(dias_gracia=dias_gracia)
+
+
+@management_router.get("/mesas", response=list[MesaOut], auth=JWTAuth())
+def list_mesas(
+    request,
+    profesorado_id: int | None = None,
+    plan_id: int | None = None,
+    materia_id: int | None = None,
+    desde: str | None = None,
+    hasta: str | None = None,
+    tipo: str | None = None,
+):
+    from datetime import date
+
+    from apps.estudiantes.api.helpers.user_utils import _resolve_docente_from_user
+    from core.permissions import can, get_user_roles, require
+
+    user_roles = get_user_roles(request.user)
+
+    active_role = request.headers.get("X-Active-Role", "").split(":")[0].lower()
+    if active_role == "docente":
+        is_docente_only = True
+    else:
+        is_docente_only = "docente" in user_roles and not can(request.user, "ver_estructura")
+
+    if is_docente_only:
+        require(request.user, "carga_finales")
+    else:
+        require(request.user, "ver_estructura")
+
+    # Barrido automático antes de listar
+    # _auto_cleanup_deserted_mesas()  # R2: Removido de GET
+
+    qs = (
+        MesaExamen.objects.select_related(
+            "materia__plan_de_estudio__profesorado",
+            "docente_presidente__persona",
+            "docente_vocal1__persona",
+            "docente_vocal2__persona",
+        )
+        .prefetch_related("actas_cargadas")
+        .annotate(num_inscriptos=Count("inscripciones", filter=Q(inscripciones__estado="INS")))
+    )
+
+    if is_docente_only:
+        docente = _resolve_docente_from_user(request.user)
+        if docente:
+            qs = qs.filter(Q(docente_presidente=docente) | Q(docente_vocal1=docente) | Q(docente_vocal2=docente))
+            # Filtro de vigencia: futuras/del día, o pasadas abiertas
+            qs = qs.filter(Q(fecha__gte=date.today()) | Q(planilla_cerrada_en__isnull=True))
+        else:
+            qs = qs.none()
+
+    allowed = allowed_profesorados(request.user)
+    if allowed is not None and not is_docente_only:
+        qs = qs.filter(materia__plan_de_estudio__profesorado_id__in=allowed)
+
+    if profesorado_id:
+        qs = qs.filter(materia__plan_de_estudio__profesorado_id=profesorado_id)
+    if plan_id:
+        qs = qs.filter(materia__plan_de_estudio_id=plan_id)
+    if materia_id:
+        qs = qs.filter(materia_id=materia_id)
+    if desde:
+        qs = qs.filter(fecha__gte=desde)
+    if hasta:
+        qs = qs.filter(fecha__lte=hasta)
+    if tipo and not is_docente_only:
+        qs = qs.filter(tipo=tipo.upper())
+
+    docente_actual = _resolve_docente_from_user(request.user) if is_docente_only else None
+    qs = qs.order_by("fecha", "hora_desde")
+    return [_serialize_mesa(m, docente_actual=docente_actual, is_docente_only=is_docente_only) for m in qs]
+
+
+@management_router.post("/mesas", response=MesaOut, auth=JWTAuth())
+def create_mesa(request, payload: MesaIn):
+    require(request.user, "editar_estructura")
+    materia = get_object_or_404(Materia, id=payload.materia_id)
+    ensure_profesorado_access(request.user, materia.plan_de_estudio.profesorado_id)
+
+    if payload.modalidad and payload.modalidad.upper() == "LIB" and not materia.permite_mesa_libre:
+        raise HttpError(422, "Esta materia no está habilitada para exámenes en condición libre.")
+
+    # Dos mesas iguales el mismo día dejaban el acta colgada de cualquiera de
+    # las dos. Se avisa acá para no exponer el error de la restricción de la base.
+    modalidad = payload.modalidad.upper()
+    existente = MesaExamen.objects.filter(materia=materia, fecha=payload.fecha, modalidad=modalidad).first()
+    if existente:
+        hora = existente.hora_desde.strftime("%H:%M") if existente.hora_desde else "sin hora"
+        raise HttpError(
+            409,
+            f"Ya existe una mesa de {materia.nombre} en condición "
+            f"{existente.get_modalidad_display().lower()} para el {payload.fecha} "
+            f"({existente.codigo}, {hora}). Usá esa mesa o elegí otra fecha.",
+        )
+
+    est_exclusivo = None
+    if payload.tipo.upper() == "ESP" and payload.estudiante_exclusivo_dni:
+        from core.models import Estudiante
+
+        est_exclusivo = Estudiante.objects.filter(persona__dni=payload.estudiante_exclusivo_dni).first()
+        if not est_exclusivo:
+            raise HttpError(404, f"Estudiante con DNI {payload.estudiante_exclusivo_dni} no encontrado.")
+
+    mesa = MesaExamen.objects.create(
+        materia=materia,
+        tipo=payload.tipo.upper(),
+        modalidad=payload.modalidad.upper(),
+        fecha=payload.fecha,
+        hora_desde=payload.hora_desde,
+        hora_hasta=payload.hora_hasta,
+        aula=payload.aula,
+        cupo=payload.cupo,
+        ventana_id=payload.ventana_id,
+        docente_presidente_id=payload.docente_presidente_id,
+        docente_vocal1_id=payload.docente_vocal1_id,
+        docente_vocal2_id=payload.docente_vocal2_id,
+        numero_mesa=payload.numero_mesa,
+        estudiante_exclusivo=est_exclusivo,
+    )
+    log_action_from_request(
+        request,
+        accion=AuditLog.Accion.CREATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Creación de mesa de examen: {materia.nombre} ({mesa.fecha} {mesa.hora_desde})",
+        entidad="MesaExamen",
+        entidad_id=mesa.id,
+        after=snapshot(mesa),
+        metadata={
+            "materia_id": materia.id,
+            "materia_nombre": materia.nombre,
+            "tipo": mesa.tipo,
+            "modalidad": mesa.modalidad,
+        },
+    )
+    return _serialize_mesa(mesa)
+
+
+@management_router.put("/mesas/{mesa_id}", response=MesaOut, auth=JWTAuth())
+def update_mesa(request, mesa_id: int, payload: MesaIn):
+    require(request.user, "editar_estructura")
+    mesa = get_object_or_404(MesaExamen, id=mesa_id)
+    ensure_profesorado_access(request.user, mesa.materia.plan_de_estudio.profesorado_id)
+
+    if payload.modalidad and payload.modalidad.upper() == "LIB" and not mesa.materia.permite_mesa_libre:
+        raise HttpError(422, "Esta materia no está habilitada para exámenes en condición libre.")
+
+    for attr, value in payload.dict().items():
+        if attr in ("materia_id", "estudiante_exclusivo_dni"):
+            continue
+        if value is not None:
+            setattr(mesa, attr, value)
+
+    if mesa.tipo == "ESP" and payload.estudiante_exclusivo_dni is not None:
+        from core.models import Estudiante
+
+        est_exc = Estudiante.objects.filter(persona__dni=payload.estudiante_exclusivo_dni).first()
+        mesa.estudiante_exclusivo = est_exc
+    elif payload.estudiante_exclusivo_dni is None and mesa.tipo == "ESP":
+        mesa.estudiante_exclusivo = None
+
+    before_snap = snapshot(mesa)
+    mesa.save()
+    after_snap = snapshot(mesa)
+
+    log_action_from_request(
+        request,
+        accion=AuditLog.Accion.UPDATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Modificación de mesa de examen ID {mesa.id}: {mesa.materia.nombre} ({mesa.fecha})",
+        entidad="MesaExamen",
+        entidad_id=mesa.id,
+        before=before_snap,
+        after=after_snap,
+    )
+    return _serialize_mesa(mesa)
+
+
+@management_router.delete("/mesas/{mesa_id}", response={204: None}, auth=JWTAuth())
+def delete_mesa(request, mesa_id: int):
+    require(request.user, "editar_estructura")
+    mesa = get_object_or_404(MesaExamen.objects.select_related("materia__plan_de_estudio__profesorado"), id=mesa_id)
+    ensure_profesorado_access(request.user, mesa.materia.plan_de_estudio.profesorado_id)
+
+    before_snap = snapshot(mesa)
+    inscripciones_count = getattr(mesa, "inscripciones", None) and mesa.inscripciones.count() or 0
+    materia_nombre = mesa.materia.nombre if mesa.materia else ""
+
+    # Las solicitudes apuntan a la mesa con SET_NULL: si no las devolvemos a
+    # PENDIENTE quedan en estado "Mesa Aprobada" sin mesa, y el unique_together
+    # (estudiante, materia, ventana) impide que el estudiante vuelva a solicitar.
+    solicitudes = SolicitudMesa.objects.filter(mesa_asignada=mesa)
+    solicitudes_liberadas = list(solicitudes.values_list("id", flat=True))
+
+    log_action_from_request(
+        request,
+        accion=AuditLog.Accion.DELETE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Eliminación de mesa de examen ID {mesa.id}: {materia_nombre} ({mesa.fecha})",
+        entidad="MesaExamen",
+        entidad_id=mesa.id,
+        before=before_snap,
+        metadata={
+            "materia_nombre": materia_nombre,
+            "fecha": str(mesa.fecha),
+            "hora_desde": str(mesa.hora_desde) if mesa.hora_desde else "",
+            "inscripciones_previas": inscripciones_count,
+            "solicitudes_liberadas": solicitudes_liberadas,
+        },
+    )
+
+    with transaction.atomic():
+        solicitudes.update(estado=SolicitudMesa.Estado.PENDIENTE, mesa_asignada=None)
+        mesa.delete()
+    return 204, None
+
+
+@management_router.post("/crear_mesa_desde_solicitud", response=MesaOut, auth=JWTAuth())
+def crear_mesa_desde_solicitud(request, payload: CrearMesaDesdeSolicitudIn):
+    """
+    Crea una mesa de examen a partir de una solicitud 'semilla' y agrupa
+    automáticamente a todos los demás alumnos con solicitudes idénticas
+    (misma materia, modalidad y ventana) que estén pendientes.
+    """
+    require(request.user, "editar_estructura")
+
+    # 1. Obtener la solicitud semilla
+    semilla = get_object_or_404(SolicitudMesa, id=payload.solicitud_id)
+    materia = semilla.materia
+    ensure_profesorado_access(request.user, materia.plan_de_estudio.profesorado_id)
+
+    existente = MesaExamen.objects.filter(materia=materia, fecha=payload.fecha, modalidad=semilla.modalidad).first()
+    if existente:
+        hora = existente.hora_desde.strftime("%H:%M") if existente.hora_desde else "sin hora"
+        raise HttpError(
+            409,
+            f"Ya existe una mesa de {materia.nombre} en condición "
+            f"{existente.get_modalidad_display().lower()} para el {payload.fecha} "
+            f"({existente.codigo}, {hora}). Asigná las solicitudes a esa mesa o elegí otra fecha.",
+        )
+
+    with transaction.atomic():
+        # 2. Crear la Mesa de Examen
+        mesa = MesaExamen.objects.create(
+            materia=materia,
+            tipo=MesaExamen.Tipo.EXTRAORDINARIA,
+            modalidad=semilla.modalidad,
+            fecha=payload.fecha,
+            hora_desde=payload.hora_desde,
+            hora_hasta=payload.hora_hasta,
+            aula=payload.aula,
+            cupo=payload.cupo,
+            ventana=semilla.ventana,
+            docente_presidente_id=payload.docente_presidente_id,
+            docente_vocal1_id=payload.docente_vocal1_id,
+            docente_vocal2_id=payload.docente_vocal2_id,
+            numero_mesa=payload.numero_mesa,
+        )
+
+        # 3. Buscar todas las solicitudes coincidentes que estén PENDIENTES
+        # Misma materia, misma modalidad y misma ventana de tiempo
+        solicitudes_coincidentes = SolicitudMesa.objects.filter(
+            materia=materia, modalidad=semilla.modalidad, ventana=semilla.ventana, estado="PEN"
+        )
+
+        from core.models import InscripcionMesa
+
+        # 4. Procesar cada solicitud: Aprobar, Vincular e Inscribir
+        for sol in solicitudes_coincidentes:
+            sol.estado = "PRO"  # Mesa Aprobada
+            sol.mesa_asignada = mesa
+            sol.save()
+
+            # Inscripción automática a la mesa
+            InscripcionMesa.objects.get_or_create(
+                mesa=mesa, estudiante_id=sol.estudiante_id, defaults={"estado": "INS"}
+            )
+
+    return _serialize_mesa(mesa)
+
+
+@management_router.get("/solicitudes_mesas", response=list[SolicitudMesaOut], auth=JWTAuth())
+def list_solicitudes(request, ventana_id: int | None = None, estado: str | None = None):
+    from core.permissions import can
+
+    if not (
+        can(request.user, "ver_actas") or can(request.user, "ver_estructura") or can(request.user, "editar_estructura")
+    ):
+        require(request.user, "ver_actas")
+
+    qs = SolicitudMesa.objects.select_related(
+        "estudiante__persona",
+        "materia__plan_de_estudio__profesorado",
+        "mesa_asignada__docente_presidente__persona",
+        "mesa_asignada__docente_vocal1__persona",
+        "mesa_asignada__docente_vocal2__persona",
+    ).all()
+
+    if ventana_id == -1:
+        # Histórico completo: todos los llamados, pero igual sin mesas cerradas
+        # (ver filtro común más abajo).
+        pass
+    elif ventana_id:
+        qs = qs.filter(ventana_id=ventana_id)
+    else:
+        # Por defecto: Solo el llamado extraordinario activo
+        from django.utils import timezone
+
+        hoy = timezone.now().date()
+        ventana_activa = VentanaHabilitacion.objects.filter(
+            tipo=VentanaHabilitacion.Tipo.MESAS_EXTRA, activo=True, desde__lte=hoy, hasta__gte=hoy
+        ).first()
+        if ventana_activa:
+            qs = qs.filter(ventana_id=ventana_activa.id)
+
+    # Una mesa con planilla ya cerrada (nota, ausente o cierre del presidente)
+    # dejó de necesitar gestión: no debe acumularse en ningún filtro, ni
+    # siquiera en el histórico completo, para que esto siga siendo manejable
+    # con miles de mesas a través de los años. Solo se ve acá si sigue
+    # abierta (para detectar mesas que quedaron sin cerrar).
+    qs = qs.filter(Q(mesa_asignada__isnull=True) | Q(mesa_asignada__planilla_cerrada_en__isnull=True))
+
+    if estado:
+        qs = qs.filter(estado=estado.upper())
+
+    # Filtro por profesorado si no es admin total
+    allowed = allowed_profesorados(request.user)
+    if allowed is not None:
+        qs = qs.filter(materia__plan_de_estudio__profesorado_id__in=allowed)
+
+    items = list(qs.order_by("-fecha_solicitud"))
+    materia_ids = {s.materia_id for s in items}
+
+    # Pre-cargar docentes de cátedra para el año académico actual/reciente
+    from collections import defaultdict
+
+    from django.utils import timezone
+
+    from core.models import Comision
+
+    current_year = timezone.now().year
+    comisiones = (
+        Comision.objects.filter(
+            materia_id__in=materia_ids,
+            anio_lectivo__in=[current_year, current_year - 1],
+            docente__isnull=False,
+        )
+        .select_related("docente__persona", "suplente__persona")
+        .order_by("orden", "id")
+    )
+
+    materia_docentes_map = defaultdict(list)
+    for c in comisiones:
+        d = c.suplente if (c.estado == "LIC" and c.suplente) else c.docente
+        if d and d.persona:
+            doc_str = f"{d.persona.apellido}, {d.persona.nombre}"
+            if doc_str not in materia_docentes_map[c.materia_id]:
+                materia_docentes_map[c.materia_id].append(doc_str)
+
+    res = []
+    for s in items:
+        m = s.mesa_asignada
+        pres = (
+            f"{m.docente_presidente.persona.apellido}, {m.docente_presidente.persona.nombre}"
+            if (m and m.docente_presidente and m.docente_presidente.persona)
+            else None
+        )
+        v1 = (
+            f"{m.docente_vocal1.persona.apellido}, {m.docente_vocal1.persona.nombre}"
+            if (m and m.docente_vocal1 and m.docente_vocal1.persona)
+            else None
+        )
+        v2 = (
+            f"{m.docente_vocal2.persona.apellido}, {m.docente_vocal2.persona.nombre}"
+            if (m and m.docente_vocal2 and m.docente_vocal2.persona)
+            else None
+        )
+
+        res.append(
+            SolicitudMesaOut(
+                id=s.id,
+                estudiante_id=s.estudiante_id,
+                estudiante_nombre=f"{s.estudiante.persona.apellido}, {s.estudiante.persona.nombre}",
+                estudiante_dni=s.estudiante.persona.dni,
+                materia_id=s.materia_id,
+                materia_nombre=s.materia.nombre,
+                materia_anio=s.materia.anio_cursada,
+                profesorado_nombre=s.materia.plan_de_estudio.profesorado.nombre,
+                ventana_id=s.ventana_id,
+                estado=s.estado,
+                estado_display=s.get_estado_display(),
+                fecha_solicitud=s.fecha_solicitud,
+                modalidad=s.modalidad,
+                modalidad_display=s.get_modalidad_display(),
+                observaciones=s.observaciones,
+                mesa_asignada_id=s.mesa_asignada_id,
+                fecha_mesa=m.fecha if m else None,
+                hora_mesa=m.hora_desde.strftime("%H:%M") if (m and m.hora_desde) else None,
+                aula_mesa=m.aula if m else None,
+                numero_mesa=m.numero_mesa if m else None,
+                tribunal_presidente=pres,
+                tribunal_vocal1=v1,
+                tribunal_vocal2=v2,
+                docente_nombre="; ".join(materia_docentes_map.get(s.materia_id, [])) or None,
+            )
+        )
+    return res
+
+
+@management_router.post("/solicitudes_mesas/{sol_id}/procesar", response=SolicitudMesaOut, auth=JWTAuth())
+def procesar_solicitud(request, sol_id: int, estado: str, mesa_id: int | None = None):
+    require(request.user, "editar_estructura")
+    sol = get_object_or_404(SolicitudMesa, id=sol_id)
+
+    with transaction.atomic():
+        sol.estado = estado.upper()
+        if mesa_id:
+            mesa = get_object_or_404(MesaExamen, id=mesa_id)
+            # Una solicitud solo se puede asignar a una mesa de su mismo llamado.
+            # Sin esto, un estudiante que se inscribió en un llamado puede terminar
+            # en una mesa de otro, generando registros duplicados (una solicitud
+            # por llamado, todas apuntando a la misma mesa).
+            if mesa.ventana_id is not None and sol.ventana_id is not None and mesa.ventana_id != sol.ventana_id:
+                raise HttpError(
+                    400,
+                    f"La mesa es de otro llamado (ventana {mesa.ventana_id}); la solicitud es del "
+                    f"llamado {sol.ventana_id}. Solo se puede asignar una solicitud a una mesa de su mismo llamado.",
+                )
+            sol.mesa_asignada_id = mesa_id
+            if sol.estado == "PRO":
+                from core.models import InscripcionMesa
+
+                InscripcionMesa.objects.get_or_create(
+                    mesa_id=mesa_id, estudiante_id=sol.estudiante_id, defaults={"estado": "INS"}
+                )
+        before_snap = snapshot(sol)
+        sol.save()
+        after_snap = snapshot(sol)
+
+        log_action_from_request(
+            request,
+            accion=AuditLog.Accion.UPDATE,
+            tipo_accion=AuditLog.TipoAccion.CRUD,
+            detalle_accion=f"Procesamiento solicitud mesa ID {sol.id} ({sol.materia.nombre}): {sol.estado}",
+            entidad="SolicitudMesa",
+            entidad_id=sol.id,
+            before=before_snap,
+            after=after_snap,
+            metadata={"estado_nuevo": sol.estado, "mesa_id": mesa_id, "estudiante_id": sol.estudiante_id},
+        )
+
+    return SolicitudMesaOut(
+        id=sol.id,
+        estudiante_id=sol.estudiante_id,
+        estudiante_nombre=f"{sol.estudiante.persona.apellido}, {sol.estudiante.persona.nombre}",
+        estudiante_dni=sol.estudiante.persona.dni,
+        materia_id=sol.materia_id,
+        materia_nombre=sol.materia.nombre,
+        profesorado_nombre=sol.materia.plan_de_estudio.profesorado.nombre,
+        ventana_id=sol.ventana_id,
+        estado=sol.estado,
+        estado_display=sol.get_estado_display(),
+        fecha_solicitud=sol.fecha_solicitud,
+        modalidad=sol.modalidad,
+        modalidad_display=sol.get_modalidad_display(),
+        observaciones=sol.observaciones,
+        mesa_asignada_id=sol.mesa_asignada_id,
+    )

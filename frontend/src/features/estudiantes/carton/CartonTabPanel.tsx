@@ -1,0 +1,359 @@
+
+import Alert from "@mui/material/Alert";
+import Box from "@mui/material/Box";
+import MenuItem from "@mui/material/MenuItem";
+import Stack from "@mui/material/Stack";
+import TextField from "@mui/material/TextField";
+import Typography from "@mui/material/Typography";
+import { useEffect, useMemo, useState } from "react";
+import type { CartonPlanDTO, TrayectoriaDTO } from "@/api/estudiantes";
+import type { CartonData, ExamRecord, StudentInfo } from "@/types/carton";
+import { CartonViewer } from "./CartonViewer";
+
+interface CartonTabPanelProps {
+	trayectoria: TrayectoriaDTO;
+	selectedPlanId?: string;
+	onSelectPlan?: (planId: string) => void;
+}
+
+const getCuatrimestreLabel = (
+	regimen?: string | null,
+	display?: string | null,
+): string => {
+	if (!regimen && !display) return "N/D";
+	const code = regimen ?? "";
+	switch (code) {
+		case "PCU":
+			return "1C";
+		case "SCU":
+			return "2C";
+		case "ANU":
+			return "A";
+		default: {
+			if (!display) return "N/D";
+			const normalized = display.toLowerCase();
+			if (normalized.includes("primer")) return "1C";
+			if (normalized.includes("segundo")) return "2C";
+			if (normalized.includes("anual")) return "A";
+			return display;
+		}
+	}
+};
+
+const ORDER_BY_CUATRIMESTRE: Record<string, number> = {
+	"1C": 1,
+	"2C": 2,
+	A: 3,
+};
+
+const buildStudentInfo = (
+	trayectoria: TrayectoriaDTO,
+	plan?: CartonPlanDTO,
+): StudentInfo => {
+	const estudiante = trayectoria.estudiante;
+	const planMateriaIds = plan
+		? new Set(
+				plan.materias
+					.map((materia) => materia.materia_id)
+					.filter(
+						(value): value is number => value !== null && value !== undefined,
+					),
+			)
+		: null;
+
+	const totalMaterias = planMateriaIds
+		? planMateriaIds.size
+		: (estudiante.materias_totales ??
+			(plan
+				? plan.materias.length
+				: trayectoria.regularidades.length || trayectoria.historial.length));
+
+	const planAprobadas = planMateriaIds
+		? trayectoria.aprobadas.filter((id) => planMateriaIds.has(id))
+		: [];
+	const aprobadasCount = planMateriaIds
+		? planAprobadas.length
+		: (estudiante.materias_aprobadas ?? trayectoria.aprobadas.length);
+
+	const planRegularizadas = trayectoria.regularizadas.filter((id) =>
+		planMateriaIds ? planMateriaIds.has(id) : true,
+	);
+	const planInscriptas = trayectoria.inscriptas_actuales.filter((id) =>
+		planMateriaIds ? planMateriaIds.has(id) : true,
+	);
+
+	const regularizadasCount = planMateriaIds
+		? planRegularizadas.filter((id) => !planAprobadas.includes(id)).length
+		: (estudiante.materias_regularizadas ??
+			trayectoria.regularizadas.filter(
+				(id) => !trayectoria.aprobadas.includes(id),
+			).length);
+
+	const enCursoCount = planMateriaIds
+		? planInscriptas.filter(
+				(id) => !planRegularizadas.includes(id) && !planAprobadas.includes(id),
+			).length
+		: (estudiante.materias_en_curso ??
+			trayectoria.inscriptas_actuales.filter(
+				(id) =>
+					!trayectoria.regularizadas.includes(id) &&
+					!trayectoria.aprobadas.includes(id),
+			).length);
+
+	return {
+		apellidoNombre: estudiante.apellido_nombre,
+		dni: estudiante.dni,
+		telefono: estudiante.telefono ?? undefined,
+		email: estudiante.email ?? undefined,
+		lugarNacimiento: estudiante.lugar_nacimiento ?? undefined,
+		fechaNacimiento: estudiante.fecha_nacimiento ?? undefined,
+		cursoIntroductorio: estudiante.curso_introductorio ?? undefined,
+		promedioGeneral: estudiante.promedio_general ?? undefined,
+		libretaEntregada: estudiante.libreta_entregada ?? undefined,
+		legajo: estudiante.legajo ?? null,
+		legajoEstado: estudiante.legajo_estado ?? null,
+		cohorte: estudiante.cohorte ?? null,
+		activo: estudiante.activo ?? null,
+		materiasTotales: totalMaterias ?? null,
+		materiasAprobadas: aprobadasCount ?? null,
+		materiasRegularizadas: regularizadasCount ?? null,
+		materiasEnCurso: enCursoCount ?? null,
+		fotoUrl: trayectoria.estudiante.fotoUrl ?? undefined,
+	};
+};
+
+const transformData = (
+	trayectoria: TrayectoriaDTO,
+	plan: CartonPlanDTO,
+): CartonData => {
+	const studentInfo = buildStudentInfo(trayectoria, plan);
+	const registros: ExamRecord[] = [];
+
+	plan.materias.forEach((materia) => {
+		const commonData = {
+			anio:
+				materia.anio !== null && materia.anio !== undefined
+					? String(materia.anio)
+					: "—",
+			cuatrimestre: getCuatrimestreLabel(
+				materia.regimen,
+				materia.regimen_display,
+			),
+			espacioCurricular: materia.materia_nombre,
+		};
+
+		const hasRegularidad = Boolean(
+			(materia.regularidades && materia.regularidades.length) ||
+				materia.regularidad,
+		);
+		const hasFinal = Boolean(
+			(materia.finales && materia.finales.length) || materia.final
+		);
+
+		const regularidadesList =
+			materia.regularidades && materia.regularidades.length > 0
+				? materia.regularidades
+				: materia.regularidad
+					? [materia.regularidad]
+					: [];
+
+		const finalesList =
+			materia.finales && materia.finales.length > 0
+				? materia.finales
+				: materia.final
+					? [materia.final]
+					: [];
+
+		const isEnCurso =
+			trayectoria.inscriptas_actuales?.includes(materia.materia_id) &&
+			!hasRegularidad &&
+			!hasFinal;
+
+		if (regularidadesList.length === 0 && finalesList.length === 0) {
+			registros.push({
+				...commonData,
+				tipo: isEnCurso ? "cursando" : "placeholder",
+				condicion: isEnCurso ? "CURSANDO" : undefined,
+			});
+		} else {
+			// Construimos todos los eventos cronológicos de la materia
+			type EventoItem = {
+				fecha_iso: string;
+				isFinal: boolean;
+				reg?: typeof regularidadesList[0];
+				fin?: typeof finalesList[0];
+			};
+
+			const eventos: EventoItem[] = [];
+
+			regularidadesList.forEach((reg) => {
+				eventos.push({
+					fecha_iso: reg.fecha_iso || reg.fecha || "0000-00-00",
+					isFinal: false,
+					reg,
+				});
+			});
+
+			finalesList.forEach((fin) => {
+				eventos.push({
+					fecha_iso: fin.fecha_iso || fin.fecha || "0000-00-00",
+					isFinal: true,
+					fin,
+				});
+			});
+
+			// Ordenar cronológicamente por fecha del evento
+			eventos.sort((a, b) => a.fecha_iso.localeCompare(b.fecha_iso));
+
+			eventos.forEach((ev) => {
+				if (ev.isFinal && ev.fin) {
+					registros.push({
+						...commonData,
+						tipo: "final",
+						fecha: undefined,
+						fecha_iso: ev.fin.fecha_iso || undefined,
+						condicion: undefined,
+						nota: undefined,
+						en_resguardo: false,
+						fechaFinal: ev.fin.fecha || undefined,
+						condicionFinal: ev.fin.condicion || undefined,
+						notaFinal: ev.fin.nota || undefined,
+						folio: ev.fin.folio || undefined,
+						libro: ev.fin.libro || undefined,
+						idFila: ev.fin.id_fila || undefined,
+					});
+				} else if (ev.reg) {
+					registros.push({
+						...commonData,
+						tipo: "regularidad",
+						fecha: ev.reg.fecha || undefined,
+						fecha_iso: ev.reg.fecha_iso || undefined,
+						condicion: ev.reg.condicion || undefined,
+						nota: ev.reg.nota || undefined,
+						en_resguardo: ev.reg.en_resguardo || false,
+						fechaFinal: undefined,
+						condicionFinal: undefined,
+						notaFinal: undefined,
+						folio: undefined,
+						libro: undefined,
+						idFila: undefined,
+					});
+				}
+			});
+		}
+	});
+
+	registros.sort((a, b) => {
+		const isEdiA = a.espacioCurricular.trim().toUpperCase().startsWith("EDI");
+		const isEdiB = b.espacioCurricular.trim().toUpperCase().startsWith("EDI");
+
+		// Prioridad 0: EDIs siempre al final
+		if (isEdiA !== isEdiB) {
+			return isEdiA ? 1 : -1;
+		}
+
+		const yearA = parseInt(a.anio, 10);
+		const yearB = parseInt(b.anio, 10);
+		if (!Number.isNaN(yearA) && !Number.isNaN(yearB) && yearA !== yearB) {
+			return yearA - yearB;
+		}
+
+		const orderA = ORDER_BY_CUATRIMESTRE[a.cuatrimestre] ?? 99;
+		const orderB = ORDER_BY_CUATRIMESTRE[b.cuatrimestre] ?? 99;
+		if (orderA !== orderB) return orderA - orderB;
+
+		if (a.espacioCurricular !== b.espacioCurricular) {
+			return a.espacioCurricular.localeCompare(b.espacioCurricular);
+		}
+
+		const timeA = a.fecha_iso ? new Date(a.fecha_iso).getTime() : 0;
+		const timeB = b.fecha_iso ? new Date(b.fecha_iso).getTime() : 0;
+		if (timeA && timeB && timeA !== timeB) return timeA - timeB;
+
+		return 0;
+	});
+
+	return {
+		id: trayectoria.estudiante.dni,
+		studentInfo,
+		registros,
+		edis: [],
+		profesoradoNombre: plan.profesorado_nombre,
+		planResolucion: plan.plan_resolucion,
+		createdAt: trayectoria.updated_at,
+		updatedAt: trayectoria.updated_at,
+	};
+};
+
+export const CartonTabPanel = ({
+	trayectoria,
+	selectedPlanId: controlledSelectedId,
+	onSelectPlan,
+}: CartonTabPanelProps) => {
+	const planes = trayectoria.carton ?? [];  
+	const [internalSelectedId, setInternalSelectedId] = useState(() => {
+		if (!planes.length) return "";
+		const initialId = planes[0] ? String(planes[0].plan_id) : "";
+		return initialId;
+	});
+
+	const handleSelect = (value: string) => {
+		if (onSelectPlan) {
+			onSelectPlan(value);
+		}
+		if (controlledSelectedId === undefined) {
+			setInternalSelectedId(value);
+		}
+	};
+
+	const selectedPlanId = controlledSelectedId ?? internalSelectedId;
+
+	const selectedPlan = useMemo(() => {
+		if (!planes.length) return undefined;
+		if (!selectedPlanId) return planes[0];
+		return (
+			planes.find((plan) => String(plan.plan_id) === selectedPlanId) ??
+			planes[0]
+		);
+	}, [planes, selectedPlanId]);
+
+	const transformedData = useMemo(() => {
+		if (!selectedPlan) return null;
+		return transformData(trayectoria, selectedPlan);
+	}, [trayectoria, selectedPlan]);
+
+	if (!planes.length || !transformedData) {
+		return (
+			<Box p={3}>
+				<Alert severity="info">
+					No hay datos del cartón disponibles para este estudiante.
+				</Alert>
+			</Box>
+		);
+	}
+
+	return (
+		<Stack spacing={2}>
+			{planes.length > 1 && (
+				<TextField
+					select
+					size="small"
+					label="Plan de estudio"
+					value={selectedPlanId}
+					onChange={(event) => handleSelect(event.target.value)}
+					sx={{ maxWidth: 320 }}
+				>
+					{planes.map((plan) => (
+						<MenuItem key={plan.plan_id} value={String(plan.plan_id)}>
+							<Typography variant="body2">
+								{plan.profesorado_nombre} — Plan {plan.plan_resolucion}
+							</Typography>
+						</MenuItem>
+					))}
+				</TextField>
+			)}
+
+			<CartonViewer data={transformedData} />
+		</Stack>
+	);
+};

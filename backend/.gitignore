@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.log
+
+# Envs
+.env
+.env.*
+!.env.example
+.venv/
+.venv_host/
+venv/
+!.env.docker.example
+
+# Django
+media/
+staticfiles/
+db.sqlite3
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/
+
+# SSH keys (never inside the project)
+.ssh/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Build / dist
+build/
+dist/
+
+# Backups and temporary data
+*.sql
+*.sql.gz
+*.csv
+
+# Local tests and scripts (Only in DEV)
+# Con barra inicial: solo la raiz del backend. Sin ella tambien se ignoraban los
+# conftest.py legitimos dentro de los paquetes de tests, que si van al repo:
+# el CI clona y sin ellos las fixtures figuran como "not found".
+/test_*.py
+/conftest*.py
+Temporal/
+*.py.backup
+*.old

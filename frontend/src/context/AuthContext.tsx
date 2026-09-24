@@ -1,0 +1,522 @@
+/**
+ * @module Context/Auth
+ * @description Proveedor central de Autenticación y Autorización (RBAC).
+ * Gestiona el ciclo de vida de la sesión, persistencia de perfil de usuario,
+ * sistema de "Keep-Alive" por actividad y el mecanismo de simulación de roles (Impersonation).
+ */
+
+import { useQueryClient } from "@tanstack/react-query";
+import type React from "react";
+import {
+	createContext,
+	useCallback,
+	useContext,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
+import { useNavigate } from "react-router-dom";
+import { client, setUnauthorizedHandler } from "@/api/client";
+import { RoleAssignment, User } from "@/types/auth";
+import { setGlobalRoleOverride } from "@/utils/roles";
+
+interface AuthContextType {
+	/** Usuario actualmente autenticado */
+	user: User;
+	/** Indica si la sesión inicial está siendo validada */
+	loading: boolean;
+	/** Inicia sesión mediante DNI/Legajo y contraseña */
+	login: (loginId: string, password: string) => Promise<User>;
+	/** Cierra la sesión en cliente y servidor */
+	logout: () => Promise<void>;
+	/** Sincroniza el estado local con la base de datos del servidor */
+	refreshProfile: () => Promise<User | null>;
+	/** Rol temporal seleccionado (para pruebas de admin) */
+	roleOverride: string | null;
+	/** Cambia el rol activo para la sesión actual */
+	setRoleOverride: (role: string | null) => void;
+	/** Lista de roles a los que el usuario tiene acceso legítimo o por privilegios admin */
+	availableRoleOptions: Array<{ value: string; label: string }>;
+	/** Rol activo seleccionado por el usuario para su sesión actual */
+	activeRole: string | null;
+	/** Cambia el rol activo de la sesión actual */
+	setActiveRole: (role: string | null) => void;
+	/** Simula la sesión de un estudiante o docente por DNI (exclusivo admin) */
+	impersonateUser: (dni: string) => Promise<User>;
+	/** Finaliza la simulación y retorna a la cuenta de Admin original */
+	stopImpersonate: () => Promise<User>;
+}
+
+const AuthContext = createContext<AuthContextType | null>(null);
+
+/** Configuraciones de mantenimiento de sesión */
+const KEEP_ALIVE_INTERVAL_MS = 2 * 60 * 1000; // Intento de refresco cada 2 min
+const ACTIVITY_WINDOW_MS = 5 * 60 * 1000; // Solo si hubo actividad en los últimos 5 min
+
+/**
+ * Normaliza la entrada de roles que puede venir como String, Array o JSON String
+ * desde diferentes legados del backend.
+ */
+const normalizeRolesInput = (input: unknown): string[] => {
+	if (Array.isArray(input)) {
+		return input.map((r) => String(r ?? "").trim()).filter((r) => r.length > 0);
+	}
+	if (typeof input === "string") {
+		const value = input.trim();
+		if (!value) return [];
+		if (value.startsWith("[") && value.endsWith("]")) {
+			try {
+				const parsed = JSON.parse(value);
+				if (Array.isArray(parsed))
+					return parsed
+						.map((r) => String(r ?? "").trim())
+						.filter((r) => r.length > 0);
+			} catch {
+				/* fallback */
+			}
+		}
+		return value
+			.split(",")
+			.map((r) => r.trim())
+			.filter((r) => r.length > 0);
+	}
+	return [];
+};
+
+/**
+ * Mapea la respuesta cruda del API a un objeto User tipado y normalizado.
+ */
+const normalizeUserPayload = (raw: unknown): User => {
+	if (!raw || typeof raw !== "object") return null;
+	const r = raw as Record<string, unknown>;
+	return {
+		...r,
+		roles: normalizeRolesInput(r.roles),
+	} as User;
+};
+
+/**
+ * Proveedor de Contexto de Autenticación.
+ * Debe envolver toda la aplicación (en App.tsx) para habilitar hooks de seguridad.
+ */
+export const AuthProvider: React.FC<React.PropsWithChildren> = ({
+	children,
+}) => {
+	const [user, setUser] = useState<User>(null);
+	const queryClient = useQueryClient();
+
+	// El caché de React Query guarda datos del usuario anterior (perfil, legajo,
+	// notas). Si no se vacía al cambiar de identidad, el siguiente que entra en el
+	// mismo navegador los ve. Se limpia explícitamente en login/logout/simulación
+	// y, como red de seguridad, ante cualquier otro cambio (ej. sesión vencida).
+	const identidad = user ? `${user.id ?? user.dni}:${user.is_impersonated ? 1 : 0}` : null;
+	const identidadPrevia = useRef<string | null>(null);
+	useEffect(() => {
+		if (identidadPrevia.current !== identidad) {
+			if (identidadPrevia.current !== null) queryClient.clear();
+			identidadPrevia.current = identidad;
+		}
+	}, [identidad, queryClient]);
+
+	const [loading, setLoading] = useState(true);
+	const [bootstrapped, setBootstrapped] = useState(false);
+	const [roleOverride, setRoleOverrideState] = useState<string | null>(() => {
+		try {
+			return sessionStorage.getItem("roleOverride") || null;
+		} catch {
+			return null;
+		}
+	});
+
+	const activityRef = useRef<number>(Date.now());
+	const navigate = useNavigate();
+
+	/**
+	 * Rutas que son 100% públicas y NO deben redirigir al login
+	 * aunque el servidor devuelva 401 (p.ej. usuario sin sesión visitando preinscripción).
+	 */
+	const PUBLIC_PATHS = [
+		"/preinscripcion",
+		"/login",
+		"/403",
+		"/auth/callback",
+		"/docentes/asistencia",
+		"/debug/inscripcion-preview",
+	];
+
+	/**
+	 * Acción de emergencia ante detección de sesión expirada (401 en client.ts).
+	 * No redirige si la ruta actual es una ruta pública.
+	 */
+	const redirectToLogin = useCallback(() => {
+		setUser(null);
+		const currentPath = window.location.pathname;
+		const isPublic = PUBLIC_PATHS.some(
+			(p) => currentPath === p || currentPath.startsWith(p + "/"),
+		);
+		if (!isPublic) {
+			navigate("/login", { replace: true });
+		}
+	}, [navigate]);  
+
+	/**
+	 * Obtiene el perfil del usuario actual.
+	 * Usado para validación inicial (Bootstrap) y actualizaciones de perfil.
+	 */
+	const refreshProfile = async (): Promise<User | null> => {
+		try {
+			const { data } = await client.get(`auth/profile/?_t=${Date.now()}`, {
+				suppressErrorToast: true,
+							} as any);
+			const normalized = normalizeUserPayload(data);
+			setUser(normalized);
+			return normalized;
+					} catch (err: any) {
+			setUser(null);
+			throw err;
+		}
+	};
+
+	/**
+	 * BOOTSTRAP: Intenta recuperar sesión existente al cargar/refrescar la app.
+	 */
+	useEffect(() => {
+		let mounted = true;
+		(async () => {
+			try {
+				if (!bootstrapped) {
+					await Promise.race([
+						refreshProfile(),
+						new Promise((_, reject) =>
+							setTimeout(() => reject(new Error("Timeout")), 5000),
+						),
+					]);
+				}
+			} catch (_e) {
+				setUser(null);
+			} finally {
+				if (mounted) {
+					setBootstrapped(true);
+					setLoading(false);
+				}
+			}
+		})();
+		return () => {
+			mounted = false;
+		};
+	}, [bootstrapped]);
+
+	/**
+	 * MONITOREO DE ACTIVIDAD: Detecta interacción humana para el sistema Keep-Alive.
+	 */
+	useEffect(() => {
+		const updateActivity = () => {
+			activityRef.current = Date.now();
+		};
+		const events: Array<keyof WindowEventMap> = [
+			"mousemove",
+			"keydown",
+			"click",
+			"scroll",
+		];
+		events.forEach((evt) => window.addEventListener(evt, updateActivity));
+		return () =>
+			events.forEach((evt) => window.removeEventListener(evt, updateActivity));
+	}, []);
+
+	/**
+	 * Vincula el interceptor de Axios con la lógica de UI de AuthContext.
+	 */
+	useEffect(() => {
+		setUnauthorizedHandler(redirectToLogin);
+		return () => setUnauthorizedHandler(null);
+	}, [redirectToLogin]);
+
+	/**
+	 * REGRESO DE SESIÓN (Keep-Alive):
+	 * Refresca silenciosamente las cookies de sesión si el usuario está activo.
+	 */
+	useEffect(() => {
+		if (!user) return;
+		const intervalId = window.setInterval(async () => {
+			if (Date.now() - activityRef.current > ACTIVITY_WINDOW_MS) return;
+			try {
+								await client.post("auth/refresh/", undefined, {
+					suppressErrorToast: true,
+				} as any);
+			} catch (_err) {
+				redirectToLogin();
+			}
+		}, KEEP_ALIVE_INTERVAL_MS);
+		return () => window.clearInterval(intervalId);
+	}, [user, redirectToLogin]);
+
+	const login = async (loginId: string, password: string) => {
+		const id = String(loginId).trim();
+		const payload = {
+			login: id,
+			username: id,
+			dni: id,
+			email: id,
+			password: String(password),
+		};
+
+		try {
+			const { data } = await client.post("auth/login/", payload);
+			const u: User = normalizeUserPayload(data?.user);
+			if (!u)
+				throw new Error(
+					"La respuesta del servidor no contiene datos de usuario.",
+				);
+			queryClient.clear();
+			setUser(u);
+			return u;
+					} catch (err: any) {
+			if (err.message && (err.status || err.code)) throw err;
+			const status = err?.response?.status;
+			const msg =
+				err?.response?.data?.message ||
+				err?.response?.data?.detail ||
+				(status === 400
+					? "Datos inválidos."
+					: status === 401
+						? "Credenciales incorrectas."
+						: "No se pudo iniciar sesión.");
+			throw new Error(msg);
+		}
+	};
+
+	const logout = async () => {
+		try {
+			await client.post("auth/logout/");
+			 
+		} catch (err: any) {
+			void 0;
+		} finally {
+			queryClient.clear();
+			setUser(null);
+			setRoleOverride(null);
+		}
+	};
+
+	/**
+	 * Calcula el menú de roles disponibles.
+	 * Los administradores ven todos los roles del sistema para propósitos de Testing/Soporte.
+	 */
+	const availableRoleOptions = useMemo(() => {
+		if (!user) return [];
+		const ROLE_LABELS: Record<string, string> = {
+			admin: "Administrador",
+			secretaria: "Secretaría",
+			bedel: "Bedelía",
+			bedel_secretaria: "Bedelía de Secretaría",
+			docente: "Docentes",
+			tutor: "Tutorías",
+			coordinador: "Coordinación",
+			jefes: "Jefatura",
+			jefa_aaee: "Jefa A.A.E.E.",
+			consulta: "Consulta",
+			estudiante: "Estudiante",
+			equivalencias: "Equipo de equivalencias",
+			titulos: "Títulos",
+			curso_intro: "Curso Introductorio",
+			attp: "A.T.T.P.",
+			rectorado: "Rectorado",
+		};
+
+		const normalized = new Set<string>();
+		(user.roles ?? []).forEach((r) => {
+			const role = (r || "").toLowerCase().trim();
+			if (!role) return;
+			if (role === "estudiantes") normalized.add("estudiante");
+			else if (role === "bedel_secretaria") normalized.add("bedel_secretaria");
+			else if (role.startsWith("bedel")) normalized.add("bedel");
+			else if (role.startsWith("secretaria")) normalized.add("secretaria");
+			else if (role.startsWith("coordinador")) normalized.add("coordinador");
+			else normalized.add(role);
+		});
+
+		(user.role_assignments ?? []).forEach((asg) => {
+			const role = (asg.role || "").toLowerCase().trim();
+			if (!role) return;
+			if (role === "estudiantes") normalized.add("estudiante");
+			else if (role === "bedel_secretaria") normalized.add("bedel_secretaria");
+			else if (role.startsWith("bedel")) normalized.add("bedel");
+			else if (role.startsWith("secretaria")) normalized.add("secretaria");
+			else if (role.startsWith("coordinador")) normalized.add("coordinador");
+			else normalized.add(role);
+		});
+
+		if ((normalized.has("admin") || user.is_superuser) && !user.is_impersonated) {
+			Object.keys(ROLE_LABELS).forEach((role) => normalized.add(role));
+		}
+		return Array.from(normalized)
+			.sort()
+			.map((role) => ({ value: role, label: ROLE_LABELS[role] ?? role }));
+	}, [user]);
+
+	/**
+	 * Aplica un override temporal de rol (Impersonation).
+	 * Solo afecta al filtrado de permisos en el lado del cliente.
+	 */
+	const setRoleOverride = (role: string | null) => {
+		const normalized = role ? role.toLowerCase().trim() : null;
+		setRoleOverrideState(normalized);
+		try {
+			if (normalized) sessionStorage.setItem("roleOverride", normalized);
+			else sessionStorage.removeItem("roleOverride");
+		} catch {
+			/* ignore */
+		}
+	};
+
+	/** Sincroniza el override con utilidades globales de permisos */
+	useEffect(() => {
+		if (!user) {
+			setGlobalRoleOverride(null);
+			setRoleOverrideState(null);
+			return;
+		}
+		if (!roleOverride) {
+			setGlobalRoleOverride(null);
+			return;
+		}
+		const valid = availableRoleOptions.some(
+			(opt) => opt.value === roleOverride,
+		);
+		if (!valid) {
+			setGlobalRoleOverride(null);
+			setRoleOverrideState(null);
+			return;
+		}
+		setGlobalRoleOverride(roleOverride);
+	}, [user, roleOverride, availableRoleOptions]);
+
+	const [activeRole, setActiveRoleState] = useState<string | null>(() => {
+		try {
+			return localStorage.getItem("ipes_active_role") || null;
+		} catch {
+			return null;
+		}
+	});
+
+	const setActiveRole = (role: string | null) => {
+		const normalized = role ? role.toLowerCase().trim() : null;
+		setActiveRoleState(normalized);
+		try {
+			if (normalized) {
+				localStorage.setItem("ipes_active_role", normalized);
+			} else {
+				localStorage.removeItem("ipes_active_role");
+			}
+		} catch {
+			/* ignore */
+		}
+	};
+
+	const impersonateUser = async (dni: string): Promise<User> => {
+		try {
+			const { data } = await client.post("auth/impersonate/", { dni: dni.trim() });
+			const u: User = normalizeUserPayload(data?.user);
+			if (!u) throw new Error("Respuesta inválida del servidor al simular usuario.");
+			
+			// Determinar el rol principal del usuario simulado
+			const targetRoles = (u.roles ?? []).map((r) => (r || "").toLowerCase().trim()).filter(Boolean);
+			const initialRole = targetRoles.length > 0 ? targetRoles[0] : null;
+
+			setRoleOverride(initialRole);
+			setActiveRoleState(initialRole);
+			try {
+				if (initialRole) {
+					localStorage.setItem("ipes_active_role", initialRole);
+					sessionStorage.setItem("roleOverride", initialRole);
+				} else {
+					localStorage.removeItem("ipes_active_role");
+					sessionStorage.removeItem("roleOverride");
+				}
+			} catch {
+				/* ignore */
+			}
+			queryClient.clear();
+			setUser(u);
+			return u;
+		} catch (err: any) {
+			const msg =
+				err?.response?.data?.message ||
+				err?.response?.data?.detail ||
+				err?.message ||
+				"No se pudo simular el usuario.";
+			throw new Error(msg);
+		}
+	};
+
+	const stopImpersonate = async (): Promise<User> => {
+		try {
+			const { data } = await client.post("auth/stop-impersonate/");
+			const u: User = normalizeUserPayload(data?.user);
+			if (!u) throw new Error("Respuesta inválida del servidor al finalizar simulación.");
+			setRoleOverride(null);
+			setActiveRoleState(null);
+			try {
+				localStorage.removeItem("ipes_active_role");
+				sessionStorage.removeItem("roleOverride");
+			} catch {
+				/* ignore */
+			}
+			queryClient.clear();
+			setUser(u);
+			return u;
+		} catch (err: any) {
+			const msg =
+				err?.response?.data?.message ||
+				err?.response?.data?.detail ||
+				err?.message ||
+				"No se pudo volver a la sesión de administrador.";
+			throw new Error(msg);
+		}
+	};
+
+	// Limpiar activeRole al cerrar sesión
+	useEffect(() => {
+		if (!user) {
+			setActiveRoleState(null);
+			try {
+				localStorage.removeItem("ipes_active_role");
+			} catch {
+				/* ignore */
+			}
+		}
+	}, [user]);
+
+	return (
+		<AuthContext.Provider
+			value={{
+				user,
+				loading,
+				login,
+				logout,
+				refreshProfile,
+				roleOverride,
+				setRoleOverride,
+				availableRoleOptions,
+				activeRole,
+				setActiveRole,
+				impersonateUser,
+				stopImpersonate,
+			}}
+		>
+			{children}
+		</AuthContext.Provider>
+	);
+};
+
+/**
+ * Hook personalizado para acceder de forma segura a los datos del usuario.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export const useAuth = () => {
+	const ctx = useContext(AuthContext);
+	if (!ctx) throw new Error("useAuth must be used within AuthProvider");
+	return ctx;
+};

@@ -1,0 +1,33 @@
+from apps.common.api_schemas import ApiResponse
+from apps.common.date_utils import format_date
+from core.models import Materia, Regularidad
+
+from ..schemas import RegularidadVigenciaOut
+from .helpers import _calcular_vigencia_regularidad, _ensure_estudiante_access, _resolve_estudiante
+from .router import estudiantes_router
+
+
+@estudiantes_router.get("/vigencia-regularidad", response=dict)
+def vigencia_regularidad(request, materia_id: int, dni: str | None = None):
+    """Calcula hasta cuándo está vigente la regularidad del estudiante en una materia."""
+    _ensure_estudiante_access(request, dni)
+    est = _resolve_estudiante(request, dni)
+    if not est:
+        return {"vigente": False, "motivo": "estudiante_no_encontrado"}
+
+    materia = Materia.objects.filter(id=materia_id).first()
+    if not materia:
+        return {"vigente": False, "motivo": "materia_no_encontrada"}
+
+    reg = Regularidad.objects.filter(estudiante=est, materia=materia).order_by("-fecha_cierre").first()
+    if not reg or reg.situacion != Regularidad.Situacion.REGULAR:
+        return {"vigente": False, "motivo": "sin_regularidad"}
+
+    vigencia_limite, intentos, _ = _calcular_vigencia_regularidad(est, reg)
+    return {
+        "vigente": True,
+        "fecha_cierre": format_date(reg.fecha_cierre),
+        "hasta": format_date(vigencia_limite),
+        "intentos_usados": intentos,
+        "intentos_max": 3,
+    }

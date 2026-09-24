@@ -1,0 +1,715 @@
+"""
+API para la gestión de la Estructura Académica (Carreras, Planes y Materias).
+centraliza la administración de los profesorados, sus planes de estudio
+vigentes y la configuración detallada de cada materia.
+"""
+
+import logging
+from datetime import date
+from typing import Optional
+
+from django.contrib.auth.models import User
+from django.db.models import ProtectedError
+from django.shortcuts import get_object_or_404
+from ninja import Router, Schema
+from ninja.errors import HttpError
+
+logger = logging.getLogger(__name__)
+
+from apps.common.audit import log_action, snapshot
+from apps.common.constants import AppErrorCode
+from apps.common.errors import AppError
+from core.auth_ninja import JWTAuth
+from core.models import (
+    AuditLog,
+    Comision,
+    InscripcionMateriaEstudiante,
+    Materia,
+    PlanDeEstudio,
+    Profesorado,
+    ProfesoradoRequisitoDocumentacion,
+)
+from core.permissions import (
+    allowed_profesorados,
+    can,
+    ensure_profesorado_access,
+    get_user_roles,
+    require,
+)
+
+from .schemas import (
+    CerrarEDIIn,
+    MateriaIn,
+    MateriaOut,
+    PlanDeEstudioIn,
+    PlanDeEstudioOut,
+    ProfesoradoIn,
+    ProfesoradoOut,
+    RequisitoDocumentacionOut,
+)
+
+
+class MateriaInscriptoOut(Schema):
+    """Información simplificada de un estudiante inscrito en una materia."""
+
+    id: int
+    estudiante_id: int
+    estudiante: str
+    dni: str
+    email: str | None = None
+    telefono: str | None = None
+    legajo: str | None = None
+    estado: str
+    anio: int
+    comision_id: int | None = None
+    comision_codigo: str | None = None
+    asistencias_p: int = 0
+    asistencias_a: int = 0
+    asistencias_t: int = 0
+    asistencias_pct: str = "0%"
+    es_comisionado: bool = False
+    profesorado_origen: str | None = None
+
+
+def _require_view(user, profesorado_id: int | None = None) -> None:
+    """Valida permisos de lectura global o sobre una carrera específica."""
+    require(user, "ver_estructura")
+    if profesorado_id is not None:
+        ensure_profesorado_access(user, profesorado_id)
+
+
+def _require_edit(user, profesorado_id: int | None = None) -> None:
+    """Valida permisos de escritura sobre la estructura académica."""
+    require(user, "editar_estructura")
+    if profesorado_id is not None:
+        ensure_profesorado_access(user, profesorado_id)
+
+
+def _normalized_user_roles(user: User) -> set[str]:
+    """Sincroniza y normaliza los nombres de grupos de Django a roles internos."""
+    raw_names = {name.lower().strip() for name in user.groups.values_list("name", flat=True)}
+    roles = set(raw_names)
+    # Mapeo de prefijos comunes a roles base
+    for name in raw_names:
+        if name in ("bedel", "bedeles"):
+            roles.add("bedel")
+        elif name in ("bedel_secretaria", "bedel-secretaria"):
+            roles.add("bedel_secretaria")
+        elif name.startswith("secretaria"):
+            roles.add("secretaria")
+        elif name.startswith("coordinador"):
+            roles.add("coordinador")
+        elif "estudiante" in name:
+            roles.add("estudiante")
+        elif "docente" in name:
+            roles.add("docente")
+
+    if user.is_superuser or user.is_staff:
+        roles.add("admin")
+    return roles
+
+
+def _docente_from_user(user: User):
+    """Acceso al perfil docente vinculado al usuario de sistema."""
+    return getattr(user, "docente_perfil", None)
+
+
+# Instanciación de routers para la segmentación de OpenAPI
+profesorados_router = Router(tags=["Carreras"])
+planes_router = Router(tags=["Planes de Estudio"])
+materias_router = Router(tags=["Materias"])
+
+
+# --- PROFESORADOS (CARRERAS) ---
+
+
+@profesorados_router.get("/", response=list[ProfesoradoOut], auth=JWTAuth())
+def listar_carreras(request, vigentes: bool | None = None):
+    """
+    Lista todos los profesorados disponibles.
+    Aplica filtros de visibilidad basados en los permisos territoriales del usuario.
+    """
+    qs = Profesorado.objects.all().order_by("nombre")
+    if getattr(request.user, "is_authenticated", False):
+        _require_view(request.user)
+        # Filtro de seguridad: solo carreras a las que el usuario tiene acceso
+        allowed = allowed_profesorados(request.user)
+        if allowed is not None:
+            qs = qs.filter(id__in=allowed)
+
+    if vigentes is not None:
+        qs = qs.filter(activo=vigentes, inscripcion_abierta=vigentes)
+    return qs
+
+
+@profesorados_router.get("/{profesorado_id}", response=ProfesoradoOut, auth=JWTAuth())
+def get_profesorado(request, profesorado_id: int):
+    """Recupera la ficha técnica de un profesorado."""
+    profesorado = get_object_or_404(Profesorado, id=profesorado_id)
+    _require_view(request.user, profesorado.id)
+    return profesorado
+
+
+@profesorados_router.post("/", response=ProfesoradoOut, auth=JWTAuth())
+def crear_profesorado(request, payload: ProfesoradoIn):
+    """Crea una nueva oferta académica (Profesorado / Carrera)."""
+    _require_edit(request.user)
+    profesorado = Profesorado.objects.create(**payload.dict())
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.CREATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Creación de profesorado {profesorado.nombre} (ID: {profesorado.id})",
+        entidad="Profesorado",
+        entidad_id=profesorado.id,
+        after=snapshot(profesorado),
+    )
+    return profesorado
+
+
+@profesorados_router.put("/{profesorado_id}", response=ProfesoradoOut, auth=JWTAuth())
+def actualizar_profesorado(request, profesorado_id: int, payload: ProfesoradoIn):
+    """Actualiza la configuración de una carrera existente."""
+    _require_edit(request.user, profesorado_id)
+    profesorado = get_object_or_404(Profesorado, id=profesorado_id)
+    before_snap = snapshot(profesorado)
+    for attr, value in payload.dict().items():
+        setattr(profesorado, attr, value)
+    profesorado.save()
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.UPDATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Actualización de profesorado {profesorado.nombre} (ID: {profesorado.id})",
+        entidad="Profesorado",
+        entidad_id=profesorado.id,
+        before=before_snap,
+        after=snapshot(profesorado),
+    )
+    return profesorado
+
+
+@profesorados_router.delete("/{profesorado_id}", response={200: dict, 400: dict}, auth=JWTAuth())
+def eliminar_profesorado(request, profesorado_id: int):
+    """
+    Elimina formalmente un profesorado.
+    Falla si existen registros vinculados (Integridad de Referencia).
+    """
+    _require_edit(request.user, profesorado_id)
+    profesorado = get_object_or_404(Profesorado, id=profesorado_id)
+    before_snap = snapshot(profesorado)
+    prof_nombre = profesorado.nombre
+    prof_id_str = str(profesorado.id)
+    try:
+        profesorado.delete()
+        log_action(
+            user=request.user,
+            roles=get_user_roles(request.user),
+            accion=AuditLog.Accion.DELETE,
+            tipo_accion=AuditLog.TipoAccion.CRUD,
+            detalle_accion=f"Eliminación de profesorado {prof_nombre} (ID: {prof_id_str})",
+            entidad="Profesorado",
+            entidad_id=prof_id_str,
+            before=before_snap,
+        )
+        return 200, {"success": True}
+    except ProtectedError:
+        raise HttpError(400, "No se puede eliminar la carrera: existen planes o alumnos asociados.")
+    except Exception as e:
+        logger.exception("Error eliminando profesorado %s", profesorado_id)
+        raise HttpError(400, f"Error técnico al eliminar: {str(e)}")
+
+
+@profesorados_router.get("/{profesorado_id}/planes", response=list[PlanDeEstudioOut], auth=JWTAuth())
+def planes_por_profesorado(request, profesorado_id: int):
+    """Busca los planes de estudio vigentes asociados a una carrera."""
+    _require_view(request.user, profesorado_id)
+    qs = PlanDeEstudio.objects.filter(profesorado_id=profesorado_id, vigente=True).order_by("-anio_inicio", "id")
+    return list(qs)
+
+
+@profesorados_router.post("/{profesorado_id}/planes", response=PlanDeEstudioOut, auth=JWTAuth())
+def create_plan_for_profesorado(request, profesorado_id: int, payload: PlanDeEstudioIn):
+    """Registra una nueva resolución ministerial / Plan de Estudio para la carrera."""
+    _require_edit(request.user, profesorado_id)
+    profesorado = get_object_or_404(Profesorado, id=profesorado_id)
+    plan = PlanDeEstudio.objects.create(profesorado=profesorado, **payload.dict())
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.CREATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Creación de plan de estudio {plan.resolucion} (ID: {plan.id})",
+        entidad="PlanDeEstudio",
+        entidad_id=plan.id,
+        after=snapshot(plan),
+    )
+    return plan
+
+
+@profesorados_router.get(
+    "/{profesorado_id}/requisitos-documentacion", response=list[RequisitoDocumentacionOut], auth=JWTAuth()
+)
+def listar_requisitos_documentacion(request, profesorado_id: int):
+    """Lista los requisitos documentales (DNI, Títulos, etc) para el legajo de esta carrera."""
+    _require_view(request.user, profesorado_id)
+    qs = ProfesoradoRequisitoDocumentacion.objects.filter(profesorado_id=profesorado_id).order_by("orden")
+    return list(qs)
+
+
+# --- PLANES DE ESTUDIO ---
+
+
+@planes_router.get("/{plan_id}", response=PlanDeEstudioOut, auth=JWTAuth())
+def get_plan(request, plan_id: int):
+    """Obtiene el detalle de un plan de estudio y su vigencia."""
+    plan = get_object_or_404(PlanDeEstudio, id=plan_id)
+    _require_view(request.user, plan.profesorado_id)
+    return plan
+
+
+@profesorados_router.get("/planes/{plan_id}", response=PlanDeEstudioOut, auth=JWTAuth(), include_in_schema=False)
+def obtener_plan_compatibilidad(request, plan_id: int):
+    """Ruta de compatibilidad para el frontend que usa /profesorados/planes/{id}"""
+    return get_plan(request, plan_id)
+
+
+@planes_router.put("/{plan_id}", response=PlanDeEstudioOut, auth=JWTAuth())
+def update_plan(request, plan_id: int, payload: PlanDeEstudioIn):
+    """Modifica la configuración de un plan de estudio."""
+    plan = get_object_or_404(PlanDeEstudio, id=plan_id)
+    _require_edit(request.user, plan.profesorado_id)
+    before_snap = snapshot(plan)
+    for attr, value in payload.dict().items():
+        setattr(plan, attr, value)
+    plan.save()
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.UPDATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Modificación de plan de estudio {plan.resolucion} (ID: {plan.id})",
+        entidad="PlanDeEstudio",
+        entidad_id=plan.id,
+        before=before_snap,
+        after=snapshot(plan),
+    )
+    return plan
+
+
+@planes_router.delete("/{plan_id}", response={204: None}, auth=JWTAuth())
+def delete_plan(request, plan_id: int):
+    """Eliminación lógica (vigente=False) de un plan de estudio."""
+    plan = get_object_or_404(PlanDeEstudio, id=plan_id)
+    _require_edit(request.user, plan.profesorado_id)
+    before_snap = snapshot(plan)
+    plan.vigente = False
+    plan.save(update_fields=["vigente"])
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.DELETE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Baja lógica de plan de estudio {plan.resolucion} (ID: {plan.id})",
+        entidad="PlanDeEstudio",
+        entidad_id=plan.id,
+        before=before_snap,
+        after=snapshot(plan),
+    )
+    return 204, None
+
+
+@planes_router.get("/{plan_id}/materias", response=list[MateriaOut], auth=JWTAuth())
+def list_materias_for_plan(
+    request,
+    plan_id: int,
+    anio_cursada: int | None = None,
+    nombre: str | None = None,
+    formato: str | None = None,
+    regimen: str | None = None,
+    tipo_formacion: str | None = None,
+    incluir_historial: bool = False,
+):
+    """Lista la malla curricular (materias) de un plan con filtros avanzados."""
+    plan = get_object_or_404(PlanDeEstudio, id=plan_id)
+    _require_view(request.user, plan.profesorado_id)
+    materias = plan.materias.all()
+
+    # Filtrado por vigencia temporal (por defecto solo activos)
+    hoy = date.today()
+    if not incluir_historial:
+        # Excluir los que aún no empezaron
+        materias = materias.exclude(fecha_inicio__gt=hoy)
+        # Excluir materias y EDIs que ya vencieron/cerraron
+        materias = materias.exclude(fecha_fin__lt=hoy)
+
+    # Aplicación de filtros según metadata de la materia
+    if anio_cursada is not None:
+        materias = materias.filter(anio_cursada=anio_cursada)
+    if nombre:
+        materias = materias.filter(nombre__icontains=nombre)
+    if formato:
+        materias = materias.filter(formato=formato)
+    if regimen:
+        materias = materias.filter(regimen=regimen)
+    if tipo_formacion:
+        materias = materias.filter(tipo_formacion=tipo_formacion)
+
+    # Asignar la resolución del plan y permiso de libre a cada materia para el esquema
+    for m in materias:
+        m.plan_resolucion = plan.resolucion
+
+    return materias
+
+
+@planes_router.post("/{plan_id}/materias", response=MateriaOut, auth=JWTAuth())
+def create_materia_for_plan(request, plan_id: int, payload: MateriaIn):
+    """Añade una asignatura al diseño curricular del plan."""
+    plan = get_object_or_404(PlanDeEstudio, id=plan_id)
+    _require_edit(request.user, plan.profesorado_id)
+    if payload.plan_de_estudio_id != plan_id:
+        raise HttpError(400, "Inconsistencia: el ID del plan en el payload no coincide con la URL.")
+    materia = Materia.objects.create(plan_de_estudio=plan, **payload.dict())
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.CREATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Creación de materia {materia.nombre} (ID: {materia.id})",
+        entidad="Materia",
+        entidad_id=materia.id,
+        after=snapshot(materia),
+    )
+    return materia
+
+
+# --- MATERIAS ---
+
+
+@materias_router.get("/", response=list[MateriaOut], auth=JWTAuth())
+def listar_materias(
+    request,
+    search: str | None = None,
+    profesorado_id: int | None = None,
+    solo_activos: bool = False,
+    incluir_edis_cerrados: bool = False,
+):
+    """Buscador global de materias con filtros."""
+    _require_view(request.user)
+
+    # Filtro de seguridad: solo materias de carreras permitidas para el usuario
+    allowed = allowed_profesorados(request.user)
+    qs = Materia.objects.select_related("plan_de_estudio").all()
+
+    if allowed is not None:
+        if profesorado_id:
+            # Si pide uno, debe estar entre sus permitidos
+            if profesorado_id in allowed:
+                qs = qs.filter(plan_de_estudio__profesorado_id=profesorado_id)
+            else:
+                return []
+        else:
+            # Si no pide uno, solo mostramos de SUS permitidos
+            qs = qs.filter(plan_de_estudio__profesorado_id__in=allowed)
+    elif profesorado_id:
+        # Admins sin restricciones que filtran por uno
+        qs = qs.filter(plan_de_estudio__profesorado_id=profesorado_id)
+
+    if search:
+        qs = qs.filter(nombre__icontains=search)
+
+    if solo_activos:
+        qs = qs.exclude(fecha_fin__lt=date.today())
+
+    if not incluir_edis_cerrados:
+        qs = qs.exclude(is_edi=True, fecha_fin__isnull=False)
+
+    for m in qs:
+        m.plan_resolucion = m.plan_de_estudio.resolucion if m.plan_de_estudio else None
+
+    return qs[:500]
+
+
+@materias_router.get("/{materia_id}", response=MateriaOut, auth=JWTAuth())
+def get_materia(request, materia_id: int):
+    """Consulta los datos técnicos de una materia."""
+    materia = get_object_or_404(Materia, id=materia_id)
+    _require_view(request.user, materia.plan_de_estudio.profesorado_id)
+    return materia
+
+
+@materias_router.put("/{materia_id}", response=MateriaOut, auth=JWTAuth())
+def update_materia(request, materia_id: int, payload: MateriaIn):
+    """Modifica la configuración de una materia (Carga horaria, régimen, etc)."""
+    materia = get_object_or_404(Materia, id=materia_id)
+    _require_edit(request.user, materia.plan_de_estudio.profesorado_id)
+    before_snap = snapshot(materia)
+    for attr, value in payload.dict().items():
+        setattr(materia, attr, value)
+    materia.save()
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.UPDATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Modificación de materia {materia.nombre} (ID: {materia.id})",
+        entidad="Materia",
+        entidad_id=materia.id,
+        before=before_snap,
+        after=snapshot(materia),
+    )
+    return materia
+
+
+@materias_router.delete("/{materia_id}", response={204: None}, auth=JWTAuth())
+def delete_materia(request, materia_id: int):
+    """Elimina una materia del plan (Solo permitido si no hay actas/inscriptos)."""
+    materia = get_object_or_404(Materia, id=materia_id)
+    _require_edit(request.user, materia.plan_de_estudio.profesorado_id)
+    before_snap = snapshot(materia)
+    materia_nombre = materia.nombre
+    materia_id_str = str(materia.id)
+    materia.delete()
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.DELETE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Eliminación de materia {materia_nombre} (ID: {materia_id_str})",
+        entidad="Materia",
+        entidad_id=materia_id_str,
+        before=before_snap,
+    )
+    return 204, None
+
+
+@materias_router.post("/{materia_id}/cerrar-edi", response=MateriaOut, auth=JWTAuth())
+def cerrar_edi(request, materia_id: int, payload: CerrarEDIIn):
+    """
+    Cierra un EDI vigente y crea uno nuevo.
+
+    Lógica:
+    1. Valida que sea un EDI (is_edi=True)
+    2. Valida que no esté ya cerrado (fecha_fin=None)
+    3. Cierra el EDI viejo: materia_vieja.fecha_fin = fecha_fin
+    4. Crea EDI nuevo: copia todos los campos menos nombre/año/régimen
+    5. Retorna el EDI nuevo creado
+    """
+    materia_vieja = get_object_or_404(Materia, id=materia_id)
+    _require_edit(request.user, materia_vieja.plan_de_estudio.profesorado_id)
+
+    # Validaciones
+    if not materia_vieja.is_edi:
+        raise HttpError(400, "Solo se pueden cerrar EDIs (is_edi=True)")
+    if materia_vieja.fecha_fin is not None:
+        raise HttpError(400, f"Este EDI ya fue cerrado el {materia_vieja.fecha_fin}")
+
+    # Parsear fecha
+    try:
+        fecha_fin = date.fromisoformat(payload.fecha_fin)
+    except ValueError:
+        raise HttpError(400, "Formato de fecha inválido. Use YYYY-MM-DD")
+
+    before_vieja = snapshot(materia_vieja)
+
+    # Cerrar EDI viejo
+    materia_vieja.fecha_fin = fecha_fin
+    materia_vieja.save()
+
+    # El EDI cerrado deja de tener docente "activo" asignado: cerramos sus
+    # comisiones abiertas (sin borrar el registro, para no perder el historial
+    # de quién lo dictó).
+    Comision.objects.filter(materia=materia_vieja, estado=Comision.Estado.ABIERTA).update(
+        estado=Comision.Estado.CERRADA
+    )
+
+    # Crear EDI nuevo
+    materia_nueva = Materia.objects.create(
+        plan_de_estudio=materia_vieja.plan_de_estudio,
+        nombre=payload.nuevo_nombre,
+        anio_cursada=payload.nuevo_anio_cursada,
+        horas_semana=materia_vieja.horas_semana,
+        formato=materia_vieja.formato,
+        regimen=payload.nuevo_regimen,
+        tipo_formacion=materia_vieja.tipo_formacion,
+        is_edi=True,
+        fecha_fin=None,  # El nuevo está activo
+    )
+
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.UPDATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Cierre de EDI {materia_vieja.nombre} (ID: {materia_vieja.id})",
+        entidad="Materia",
+        entidad_id=materia_vieja.id,
+        before=before_vieja,
+        after=snapshot(materia_vieja),
+    )
+
+    log_action(
+        user=request.user,
+        roles=get_user_roles(request.user),
+        accion=AuditLog.Accion.CREATE,
+        tipo_accion=AuditLog.TipoAccion.CRUD,
+        detalle_accion=f"Creación de EDI {materia_nueva.nombre} (ID: {materia_nueva.id}) por renovación",
+        entidad="Materia",
+        entidad_id=materia_nueva.id,
+        after=snapshot(materia_nueva),
+    )
+
+    logger.info(f"EDI #{materia_vieja.id} cerrado. EDI #{materia_nueva.id} creado")
+    return materia_nueva
+
+
+@materias_router.get("/{materia_id}/inscriptos", response=list[MateriaInscriptoOut], auth=JWTAuth())
+def list_inscriptos_materia(request, materia_id: int, anio: int | None = None, estado: str | None = None):
+    """
+    Lista los alumnos inscritos en una materia para un ciclo lectivo.
+
+    Lógica de permisos especial:
+    - Perfil administrativo: Ve todos los inscritos del profesorado.
+    - Perfil Docente: Solo ve los alumnos de sus propias comisiones asignadas.
+    """
+    materia = get_object_or_404(Materia, id=materia_id)
+    roles = get_user_roles(request.user)
+    docente_profile = _docente_from_user(request.user)
+
+    solo_docente = False
+    # Verificamos si es un docente sin acceso administrativo
+    if "docente" in roles and not can(request.user, "ver_estructura"):
+        if not docente_profile:
+            raise AppError(403, AppErrorCode.PERMISSION_DENIED, "Perfil docente no vinculado.")
+
+        asignado = Comision.objects.filter(materia_id=materia_id, docente=docente_profile).exists()
+        if not asignado:
+            raise AppError(403, AppErrorCode.PERMISSION_DENIED, "No posees comisiones en esta asignatura.")
+        solo_docente = True
+    else:
+        # Validación estándar de gestión académica
+        _require_view(request.user, materia.plan_de_estudio.profesorado_id)
+
+    # Consulta optimizada con select_related para evitar N+1
+    inscripciones = InscripcionMateriaEstudiante.objects.select_related(
+        "estudiante__user", "estudiante__persona", "comision"
+    ).filter(materia_id=materia_id)
+
+    if solo_docente:
+        inscripciones = inscripciones.filter(comision__docente=docente_profile)
+    if anio is not None:
+        inscripciones = inscripciones.filter(anio=anio)
+    if estado:
+        inscripciones = inscripciones.filter(estado=estado)
+    else:
+        # Excluir inscripciones anuladas y rechazadas por defecto (no mostrar en listado de inscritos)
+        inscripciones = inscripciones.exclude(
+            estado__in=[
+                InscripcionMateriaEstudiante.Estado.ANULADA,
+                InscripcionMateriaEstudiante.Estado.RECHAZADA,
+            ]
+        )
+
+    # Formateo del resultado para la UI
+    from django.db.models import Count, Q
+
+    from apps.asistencia.models import AsistenciaDocente, AsistenciaEstudiante
+
+    estudiante_ids = [ins.estudiante_id for ins in inscripciones]
+    comision_ids = [ins.comision_id for ins in inscripciones if ins.comision_id]
+
+    asistencias_stats = {}
+    if estudiante_ids and comision_ids:
+        # Solo computar clases dictadas (donde el docente estuvo PRESENTE o donde se tomó asistencia explícitamente)
+        stats_query = (
+            AsistenciaEstudiante.objects.filter(
+                estudiante_id__in=estudiante_ids,
+                clase__comision_id__in=comision_ids,
+            )
+            .filter(
+                Q(clase__asistencia_docentes__estado=AsistenciaDocente.Estado.PRESENTE)
+                | ~Q(registrado_via=AsistenciaEstudiante.RegistradoVia.SISTEMA)
+            )
+            .values("estudiante_id", "clase__comision_id")
+            .annotate(
+                presentes=Count("id", filter=Q(estado__in=["presente", "tarde"]), distinct=True),
+                ausentes=Count("id", filter=Q(estado__in=["ausente", "ausente_justificada"]), distinct=True),
+                total=Count("id", distinct=True),
+            )
+        )
+        for stat in stats_query:
+            asistencias_stats[(stat["estudiante_id"], stat["clase__comision_id"])] = stat
+
+    # Mapeo de carreras de los estudiantes para detectar comisionados.
+    # Para decidir si es comisionado se consideran TODAS sus carreras sin importar el
+    # estado académico: un estudiante con la carrera inactiva o dada de baja que cursa
+    # una materia de esa misma carrera no es un comisionado. Para mostrar el origen,
+    # en cambio, solo interesan las carreras activas.
+    carreras_estudiantes = {}
+    carreras_activas_estudiantes = {}
+    from core.models import EstudianteCarrera
+
+    for ec in EstudianteCarrera.objects.filter(estudiante_id__in=estudiante_ids).select_related("profesorado"):
+        carreras_estudiantes.setdefault(ec.estudiante_id, []).append(ec.profesorado.nombre)
+        if ec.estado_academico == EstudianteCarrera.EstadoAcademico.ACTIVO:
+            carreras_activas_estudiantes.setdefault(ec.estudiante_id, []).append(ec.profesorado.nombre)
+
+    materia_profesorado = (
+        materia.plan_de_estudio.profesorado.nombre
+        if (materia.plan_de_estudio and materia.plan_de_estudio.profesorado)
+        else None
+    )
+
+    resultado: list[MateriaInscriptoOut] = []
+    for ins in inscripciones.order_by("estudiante__persona__apellido", "estudiante__persona__nombre"):
+        est = ins.estudiante
+        # Formato: Apellido, Nombre
+        if est.persona:
+            nombre_completo = f"{est.persona.apellido}, {est.persona.nombre}"
+        elif est.user:
+            nombre_completo = est.user.get_full_name()
+        else:
+            nombre_completo = est.dni
+
+        stat = asistencias_stats.get((est.id, ins.comision_id), {})
+        p = stat.get("presentes", 0)
+        a = stat.get("ausentes", 0)
+        t = stat.get("total", 0)
+        pct = f"{int((p / t) * 100)}%" if t > 0 else "-"
+
+        profesorados_alumno = carreras_estudiantes.get(est.id, [])
+        es_comisionado = False
+        profesorado_origen = None
+        if materia_profesorado and profesorados_alumno and materia_profesorado not in profesorados_alumno:
+            es_comisionado = True
+            origen = carreras_activas_estudiantes.get(est.id) or profesorados_alumno
+            profesorado_origen = ", ".join(origen)
+
+        # Email y Teléfono
+        email = est.persona.email if est.persona and est.persona.email else (est.user.email if est.user else None)
+        telefono = est.persona.telefono if est.persona else None
+
+        resultado.append(
+            MateriaInscriptoOut(
+                id=ins.id,
+                estudiante_id=est.id,
+                estudiante=nombre_completo,
+                dni=est.dni,
+                email=email,
+                telefono=telefono,
+                legajo=est.legajo,
+                estado=ins.estado,
+                anio=ins.anio,
+                comision_id=ins.comision_id,
+                comision_codigo=ins.comision.codigo if ins.comision_id else None,
+                asistencias_p=p,
+                asistencias_a=a,
+                asistencias_t=t,
+                asistencias_pct=pct,
+                es_comisionado=es_comisionado,
+                profesorado_origen=profesorado_origen,
+            )
+        )
+    return resultado

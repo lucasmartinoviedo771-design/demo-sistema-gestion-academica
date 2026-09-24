@@ -1,0 +1,110 @@
+# OS/IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+**/*.log
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+archives/
+
+# Node
+node_modules/
+dist/
+build/
+.pnpm-store/
+frontend/.pnpm-store/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Django
+db.sqlite3
+media/
+staticfiles/
+
+# Ignored PDFs
+*.pdf
+# Data and Temp
+*.csv
+*.xlsx
+*.sql
+temp/
+tmp/
+*.tmp
+backend/fix_data_safe.py
+
+**/.pytest_cache/
+**/pytest.ini
+
+# Maintenance Scripts (Local)
+backend/fix_*.py
+backend/sync_*.py
+backend/cross_reference_*.py
+backend/investigate_*.py
+backend/test_*.py
+backend/scripts/analyze_*.py
+backend/scripts/generate_*.py
+backend/scripts/cross_*.py
+backend/scripts/fix_*.py
+backend/scripts/sync_*.py
+
+# Temporary Checks (Local)
+backend/check_*.py
+backend/health_check_*.py
+
+# Local temporary files
+Temporales/
+.gemini/
+.python-version
+
+# Claude Code work files (buffers, temporal content)
+nuevo*.txt
+archivo_*.txt
+temp_*.md
+work_*.txt
+scripts/data_imports/import_estudiantes_excel.py
+scripts/data_imports/carrera_map.example.json
+
+# Test battery (local only)
+Test/
+
+# Backups
+backups/
+logs/
+scripts/backup_db.sh
+
+# Agent workflows with server-specific paths (not for version control)
+.agent/workflows/protocolo_despliegue.md
+.agent/skills/backend_standards/SKILL.md
+Reporte_*.md
+actualizar_produccion.py
+backend/scratch/
+
+# --- Datos personales, backups y bases de datos: NUNCA subir ---
+*.sql.gz
+*.gz
+*.sqlite3
+*.db
+*.dump
+*.tsv
+*.xls
+backup_*
+cookies.txt
+test_*_output.txt
+temp*.txt
+tmp*.txt

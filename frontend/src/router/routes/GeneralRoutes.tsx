@@ -1,0 +1,101 @@
+import { Navigate, Outlet, Route } from "react-router-dom";
+import { ProtectedRoute } from "@/router/guards";
+
+import { lazyPage } from "@/utils/lazy";
+
+const DashboardPage = lazyPage(() => import("../../pages/DashboardPage"));
+const PreinscripcionesPage = lazyPage(
+	() => import("../../pages/PreinscripcionesPage"),
+);
+const MensajesInboxPage = lazyPage(
+	() => import("../../pages/Mensajes/InboxPage"),
+);
+const CarrerasPage = lazyPage(() => import("../../pages/CarrerasPage"));
+const MateriaInscriptosPage = lazyPage(
+	() => import("../../pages/MateriaInscriptosPage"),
+);
+const AnalyticsDashboardPage = lazyPage(
+	() => import("../../pages/AnalyticsDashboardPage"),
+);
+const ConfirmarInscripcionPage = lazyPage(
+	() => import("../../pages/ConfirmarInscripcionPage"),
+);
+
+export const buildGeneralRoutes = () => (
+	<>
+		<Route
+			element={
+				<ProtectedRoute capability="ver_dashboard">
+					<Outlet />
+				</ProtectedRoute>
+			}
+		>
+			<Route path="/dashboard" element={<DashboardPage />} />
+		</Route>
+		<Route
+			element={
+				<ProtectedRoute capability="ver_estructura">
+					<Outlet />
+				</ProtectedRoute>
+			}
+		>
+			<Route path="/carreras" element={<CarrerasPage />} />
+		</Route>
+		<Route
+			element={
+				<ProtectedRoute capability="ver_estudiantes">
+					<Outlet />
+				</ProtectedRoute>
+			}
+		>
+			<Route
+				path="/carreras/:profesoradoId/planes/:planId/materias/:materiaId/inscriptos"
+				element={<MateriaInscriptosPage />}
+			/>
+		</Route>
+		{/* /reportes se absorbio en el dashboard: sus paneles viven ahora en las
+		    pestanas Preinscripciones, Estudiantes, Rendimiento y Ausentismo.
+		    Se deja el redirect fuera de ProtectedRoute para que cualquier link
+		    guardado llegue al dashboard, que ya aplica sus propios permisos. */}
+		<Route path="/reportes" element={<Navigate to="/dashboard" replace />} />
+		<Route
+			element={
+				<ProtectedRoute capability="ver_metricas">
+					<Outlet />
+				</ProtectedRoute>
+			}
+		>
+			<Route
+				path="/analytics"
+				element={<Navigate to="/dashboard?tab=estudiantes" replace />}
+			/>
+		</Route>
+		<Route
+			element={
+				<ProtectedRoute capability="gestionar_preinscripcion">
+					<Outlet />
+				</ProtectedRoute>
+			}
+		>
+			<Route path="/preinscripciones" element={<PreinscripcionesPage />} />
+		</Route>
+		<Route
+			element={
+				<ProtectedRoute capability="enviar_mensajes">
+					<Outlet />
+				</ProtectedRoute>
+			}
+		>
+			<Route path="/mensajes" element={<MensajesInboxPage />} />
+		</Route>
+		<Route
+			element={
+				<ProtectedRoute capability="formalizar_inscripcion">
+					<Outlet />
+				</ProtectedRoute>
+			}
+		>
+			<Route path="/gestion/confirmar" element={<ConfirmarInscripcionPage />} />
+		</Route>
+	</>
+);

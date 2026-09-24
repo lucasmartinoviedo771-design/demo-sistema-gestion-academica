@@ -1,0 +1,693 @@
+import AssignmentIcon from "@mui/icons-material/Assignment";
+import Alert from "@mui/material/Alert";
+import Box from "@mui/material/Box";
+import Button from "@mui/material/Button";
+import Chip from "@mui/material/Chip";
+import CircularProgress from "@mui/material/CircularProgress";
+import Paper from "@mui/material/Paper";
+import Stack from "@mui/material/Stack";
+import Typography from "@mui/material/Typography";
+import dayjs from "dayjs";
+import { enqueueSnackbar } from "notistack";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import {
+		ComisionOptionDTO,
+	type GuardarRegularidadPayload,
+	gestionarCierreRegularidad,
+	guardarPlanillaRegularidad,
+		MateriaOptionDTO,
+	obtenerPlanillaRegularidad,
+	type RegularidadPlanillaDTO,
+} from "@/api/cargaNotas";
+import ActaExamenForm from "@/components/secretaria/ActaExamenForm";
+import OralExamActaDialog, {
+	OralActFormValues,
+} from "@/components/secretaria/OralExamActaDialog";
+import RegularidadPlanillaEditor from "@/components/secretaria/RegularidadPlanillaEditor";
+import BackButton from "@/components/ui/BackButton";
+import FinalConfirmationDialog from "@/components/ui/FinalConfirmationDialog";
+import { PageHero } from "@/components/ui/GradientTitles";
+import { useAuth } from "@/context/AuthContext";
+import { hasAnyRole } from "@/utils/roles";
+import {
+	INSTITUTIONAL_TERRACOTTA,
+	INSTITUTIONAL_TERRACOTTA_DARK,
+} from "@/styles/institutionalColors";
+import PlanillaRegularidadDialog from "../admin/PlanillaRegularidadDialog";
+import FinalExamFiltersPanel from "./carga-notas/components/FinalExamFiltersPanel";
+import FinalExamMesasGrid from "./carga-notas/components/FinalExamMesasGrid";
+import RegularidadComisionesGrid from "./carga-notas/components/RegularidadComisionesGrid";
+import RegularidadFiltersPanel from "./carga-notas/components/RegularidadFiltersPanel";
+import { useFinalExamFilters } from "./carga-notas/hooks/useFinalExamFilters";
+import { useFinalExamPersist } from "./carga-notas/hooks/useFinalExamPersist";
+import { useFinalExamPlanilla } from "./carga-notas/hooks/useFinalExamPlanilla";
+import { useOralExamActa } from "./carga-notas/hooks/useOralExamActa";
+import { useRegularidadFilters } from "./carga-notas/hooks/useRegularidadFilters";
+import type { FiltersState, FinalFiltersState } from "./carga-notas/types";
+import GestionComisionesDialog from "./components/GestionComisionesDialog";
+
+const CargaNotasPage: React.FC = () => {
+	const { roleOverride, user } = useAuth();
+	const activeRole = (roleOverride ?? user?.roles?.[0] ?? "").toLowerCase();
+	const isDocente = activeRole === "docente";
+	const canPrintActas = hasAnyRole(user, ["admin", "secretaria", "titulos"]);
+
+	// Para docentes, no restringir tipo ni modalidad y priorizar planillas abiertas
+	React.useEffect(() => {
+		if (isDocente) {
+			setFinalFilters((prev) => ({
+				...prev,
+				tipo: "",
+				modalidad: "",
+				estadoPlanilla: "ABIERTAS",
+			}));
+		}
+	}, [isDocente]);
+
+	const [filters, setFilters] = useState<FiltersState>({
+		profesoradoId: null,
+		planId: null,
+		anio: null,
+		cuatrimestre: null,
+		anioCursada: null,
+		materiaId: null,
+		comisionId: null,
+	});
+
+	const [planilla, setPlanilla] = useState<RegularidadPlanillaDTO | null>(null);
+	const [searchParams] = useSearchParams();
+		const navigate = useNavigate();
+	const scope = searchParams.get("scope");
+	const isFinalsMode = scope === "finales";
+
+	const [loadingPlanilla, setLoadingPlanilla] = useState(false);
+	const [saving, setSaving] = useState(false);
+	const [regularidadConfirmOpen, setRegularidadConfirmOpen] = useState(false);
+	const [regularidadPendingPayload, setRegularidadPendingPayload] =
+		useState<GuardarRegularidadPayload | null>(null);
+		const [regularidadCierreLoading, setRegularidadCierreLoading] =
+		useState(false);
+		const [defaultFechaCierre, setDefaultFechaCierre] = useState<string>(() =>
+		new Date().toISOString().slice(0, 10),
+	);
+		const [defaultObservaciones, setDefaultObservaciones] = useState<string>("");
+	const [gestionComisionesOpen, setGestionComisionesOpen] = useState(false);
+	const [planillaOpen, setPlanillaOpen] = useState(false);
+
+	const [finalFilters, setFinalFilters] = useState<FinalFiltersState>({
+		ventanaId: "",
+		tipo: "",
+		modalidad: "",
+		profesoradoId: null,
+		planId: null,
+		materiaId: null,
+		anio: null,
+		cuatrimestre: null,
+		estadoPlanilla: "ABIERTAS",
+		anioMesa: null,
+	});
+
+	// --- Regularidad Filters Hook ---
+	const {
+		profesorados,
+		planes,
+		materias,
+		allComisiones,
+		loadingProfesorados,
+		loadingPlanes,
+		loadingComisiones,
+		uniqueAnios,
+		uniqueCuatrimestres,
+		uniqueAniosCursada,
+		materiaOptions,
+		filteredComisiones,
+	} = useRegularidadFilters(filters, setFilters);
+
+	// --- Final Exam Filters Hook ---
+	const {
+		ventanasFinales,
+		finalPlanes,
+		finalMaterias,
+		loadingFinalPlanes,
+		loadingFinalMaterias,
+		finalAvailableAnios,
+		finalCuatrimestreOptions,
+		finalMateriasFiltradas,
+	} = useFinalExamFilters(
+		finalFilters,
+		setFinalFilters,
+		profesorados,
+		isFinalsMode,
+	);
+
+	// --- Final Exam Planilla Hook ---
+	const {
+		finalMesas,
+		finalSelectedMesaId,
+				setFinalSelectedMesaId,
+		finalPlanilla,
+		setFinalPlanilla,
+				finalCondiciones,
+		setFinalCondiciones,
+		finalRows,
+		setFinalRows,
+		finalLoadingMesas,
+		finalLoadingPlanilla,
+		finalError,
+		setFinalError,
+		finalPermissionDenied,
+		setFinalPermissionDenied,
+		finalReadOnly,
+		fetchFinalPlanilla,
+		mapEstudianteToFinalRow,
+				handleFinalRowChange,
+		handleOpenFinalPlanilla,
+		selectedMesaResumen,
+		selectedMesaCursoLabel,
+		tribunalInfo,
+	} = useFinalExamPlanilla(finalFilters, isFinalsMode);
+
+	// --- Final Exam Persist Hook ---
+	const {
+		finalSaving,
+				finalCierreLoading,
+		finalConfirmOpen,
+		finalSuccess,
+		setFinalSuccess,
+		handleFinalSaveClick: handleFinalSaveClickBase,
+		executeGuardarFinalPlanilla,
+		cancelFinalConfirm,
+				handleFinalPlanillaCierre,
+	} = useFinalExamPersist(
+		finalSelectedMesaId,
+		finalRows,
+		finalPlanilla,
+		fetchFinalPlanilla,
+		setFinalPlanilla,
+		setFinalCondiciones,
+		setFinalRows,
+		mapEstudianteToFinalRow,
+		setFinalPermissionDenied,
+		setFinalError,
+	);
+
+		const handleFinalSaveClick = () =>
+		handleFinalSaveClickBase(finalPermissionDenied);
+
+	// --- Oral Exam Acta Hook ---
+	const {
+		oralActDrafts,
+		oralDialogRow,
+		oralActaLoading,
+		oralActaSaving,
+				downloadingOralBatch,
+				selectedOralIds,
+				toggleOralSelection,
+				handleOpenOralActa,
+		handleCloseOralActa,
+		handleSaveOralActa,
+				handleDownloadAllOralActas,
+	} = useOralExamActa(finalSelectedMesaId, finalReadOnly);
+
+	// --- Regularidad state and handlers ---
+	const selectedComision = useMemo(
+		() => filteredComisiones.find((c) => c.id === filters.comisionId) || null,
+		[filteredComisiones, filters.comisionId],
+	);
+		const regularidadReadOnly = planilla ? !planilla.puede_editar : false;
+
+	const fetchPlanilla = useCallback(
+		async (comisionId: number) => {
+			setLoadingPlanilla(true);
+			try {
+				const data = await obtenerPlanillaRegularidad(comisionId);
+				setPlanilla(data);
+				setDefaultFechaCierre(new Date().toISOString().slice(0, 10));
+				setDefaultObservaciones("");
+			} catch (_error) {
+				setPlanilla(null);
+				enqueueSnackbar("No se pudo cargar la planilla de regularidad.", {
+					variant: "error",
+				});
+			} finally {
+				setLoadingPlanilla(false);
+			}
+		},
+		[enqueueSnackbar],  
+	);
+
+	useEffect(() => {
+		if (!filters.comisionId) {
+			setPlanilla(null);
+			return;
+		}
+		fetchPlanilla(filters.comisionId);
+	}, [filters.comisionId, fetchPlanilla]);
+
+	const persistRegularidad = async (payload: GuardarRegularidadPayload) => {
+		setSaving(true);
+		try {
+			await guardarPlanillaRegularidad(payload);
+			enqueueSnackbar("Notas de regularidad guardadas correctamente.", {
+				variant: "success",
+			});
+			setDefaultFechaCierre(payload.fecha_cierre ?? "");
+			setDefaultObservaciones(payload.observaciones_generales ?? "");
+			await fetchPlanilla(payload.comision_id);
+					} catch (error: any) {
+			const message =
+				error?.response?.data?.message ||
+				"No se pudieron guardar las notas de regularidad.";
+			enqueueSnackbar(message, { variant: "error" });
+		} finally {
+			setSaving(false);
+		}
+	};
+
+		const handleGuardarRegularidad = async (
+		payload: GuardarRegularidadPayload,
+	) => {
+		setRegularidadPendingPayload(payload);
+		setRegularidadConfirmOpen(true);
+	};
+
+	const confirmRegularidadSave = async () => {
+		if (!regularidadPendingPayload) return;
+		await persistRegularidad(regularidadPendingPayload);
+		setRegularidadPendingPayload(null);
+		setRegularidadConfirmOpen(false);
+	};
+
+		const handleRegularidadCierre = async (accion: "cerrar" | "reabrir") => {
+		if (!selectedComision) return;
+		setRegularidadCierreLoading(true);
+		try {
+			await gestionarCierreRegularidad(selectedComision.id, accion);
+			enqueueSnackbar(
+				accion === "cerrar"
+					? "Planilla cerrada correctamente."
+					: "Planilla reabierta correctamente.",
+				{ variant: "success" },
+			);
+			await fetchPlanilla(selectedComision.id);
+					} catch (error: any) {
+			const message =
+				error?.response?.data?.message ||
+				"No se pudo actualizar el estado de cierre.";
+			enqueueSnackbar(message, { variant: "error" });
+		} finally {
+			setRegularidadCierreLoading(false);
+		}
+	};
+
+	const cancelRegularidadConfirm = () => {
+		if (saving) return;
+		setRegularidadConfirmOpen(false);
+		setRegularidadPendingPayload(null);
+	};
+
+	return (
+		<Box sx={{ p: { xs: 2, md: 3 }, bgcolor: "#f5f5f5", minHeight: "100vh" }}>
+			<BackButton fallbackPath="/secretaria" sx={{ mb: 2 }} />
+			<Stack gap={3}>
+				<PageHero
+					title={
+						isFinalsMode ? "Actas de Examen Final" : "Planilla de Regularidad"
+					}
+					subtitle={
+						isFinalsMode
+							? "Gestioná las mesas de examen, inscribí estudiantes y cargá las notas finales."
+							: "Gestioná la planilla de regularidad y promoción de las comisiones."
+					}
+				/>
+
+				{!isFinalsMode && (
+					<>
+						<RegularidadFiltersPanel
+							filters={filters}
+							setFilters={setFilters}
+							profesorados={profesorados}
+							planes={planes}
+							materias={materias}
+							allComisiones={allComisiones}
+							loadingProfesorados={loadingProfesorados}
+							loadingPlanes={loadingPlanes}
+							loadingComisiones={loadingComisiones}
+							uniqueAnios={uniqueAnios}
+							uniqueCuatrimestres={uniqueCuatrimestres}
+							uniqueAniosCursada={uniqueAniosCursada}
+							materiaOptions={materiaOptions}
+							onGestionComisionesClick={() => setGestionComisionesOpen(true)}
+						/>
+
+						{filters.planId && filters.materiaId && (
+							<RegularidadComisionesGrid
+								filteredComisiones={filteredComisiones}
+								selectedComisionId={filters.comisionId}
+								setFilters={setFilters}
+							/>
+						)}
+
+						{selectedComision ? (
+							loadingPlanilla ? (
+								<Paper
+									variant="outlined"
+									sx={{
+										p: 6,
+										display: "flex",
+										alignItems: "center",
+										justifyContent: "center",
+									}}
+								>
+									<CircularProgress />
+								</Paper>
+							) : planilla ? (
+								<Paper
+									variant="outlined"
+									sx={{
+										p: { xs: 4, md: 6 },
+										borderRadius: 4,
+										border: "1px solid rgba(79, 70, 229,0.2)",
+										background: "linear-gradient(to bottom, #ffffff, #fafafa)",
+										boxShadow: "0 10px 30px rgba(0,0,0,0.04)",
+									}}
+								>
+									<Stack spacing={3} alignItems="center" textAlign="center">
+										<Box
+											sx={{
+												width: 72,
+												height: 72,
+												borderRadius: "50%",
+												bgcolor: "rgba(79, 70, 229,0.08)",
+												color: INSTITUTIONAL_TERRACOTTA,
+												display: "flex",
+												alignItems: "center",
+												justifyContent: "center",
+												boxShadow: "0 6px 15px rgba(79, 70, 229,0.1)",
+											}}
+										>
+											<AssignmentIcon sx={{ fontSize: 36 }} />
+										</Box>
+										<Box>
+											<Typography
+												variant="h5"
+												fontWeight={700}
+												color="text.primary"
+											>
+												Planilla de Regularidad y Promoción Oficial
+											</Typography>
+											<Typography
+												variant="body2"
+												color="text.secondary"
+												sx={{ maxWidth: 500, mt: 1.5, lineHeight: 1.6 }}
+											>
+												Utilizá el editor oficial emergente para registrar
+												calificaciones de trabajos prácticos, parciales,
+												asistencia y situaciones académicas finales según el
+												reglamento institucional. La lista de estudiantes
+												activos se auto-completa automáticamente.
+											</Typography>
+										</Box>
+										<Button
+											variant="contained"
+											size="large"
+											sx={{
+												borderRadius: 999,
+												px: 5,
+												py: 1.8,
+												fontSize: "0.95rem",
+												fontWeight: 600,
+												backgroundColor: INSTITUTIONAL_TERRACOTTA,
+												boxShadow: "0 8px 20px rgba(79, 70, 229,0.3)",
+												transition: "all 0.2s ease-in-out",
+												"&:hover": {
+													transform: "translateY(-2px)",
+													boxShadow: "0 10px 25px rgba(79, 70, 229,0.4)",
+													backgroundColor: INSTITUTIONAL_TERRACOTTA_DARK,
+												},
+											}}
+											onClick={() => setPlanillaOpen(true)}
+										>
+											Cargar / Editar Planilla de Regularidad
+										</Button>
+									</Stack>
+								</Paper>
+							) : (
+								<Paper variant="outlined" sx={{ p: { xs: 2, md: 3 } }}>
+									<Typography color="text.secondary">
+										No pudimos obtener la planilla de regularidad para la
+										comisión seleccionada.
+									</Typography>
+								</Paper>
+							)
+						) : filters.materiaId ? (
+							<Paper variant="outlined" sx={{ p: { xs: 2, md: 3 } }}>
+								<Typography color="text.secondary">
+									Seleccioná una comisión para continuar con la carga de notas.
+								</Typography>
+							</Paper>
+						) : null}
+					</>
+				)}
+
+				{isFinalsMode && (
+					<Stack gap={3}>
+						<Paper sx={{ p: 3 }}>
+							<Stack gap={3}>
+								{isDocente ? (
+									<Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: "wrap", gap: 1 }}>
+										<Typography variant="body2" fontWeight={600} color="text.secondary">
+											Ver:
+										</Typography>
+										<Chip
+											label="Mesas abiertas (Pendientes)"
+											color={finalFilters.estadoPlanilla === "ABIERTAS" ? "primary" : "default"}
+											variant={finalFilters.estadoPlanilla === "ABIERTAS" ? "filled" : "outlined"}
+											onClick={() =>
+												setFinalFilters((prev) => ({
+													...prev,
+													estadoPlanilla: "ABIERTAS",
+												}))
+											}
+											clickable
+											size="small"
+										/>
+										<Chip
+											label="Mesas cerradas"
+											color={finalFilters.estadoPlanilla === "CERRADAS" ? "primary" : "default"}
+											variant={finalFilters.estadoPlanilla === "CERRADAS" ? "filled" : "outlined"}
+											onClick={() =>
+												setFinalFilters((prev) => ({
+													...prev,
+													estadoPlanilla: "CERRADAS",
+												}))
+											}
+											clickable
+											size="small"
+										/>
+										<Chip
+											label="Todas mis mesas"
+											color={finalFilters.estadoPlanilla === "TODAS" ? "primary" : "default"}
+											variant={finalFilters.estadoPlanilla === "TODAS" ? "filled" : "outlined"}
+											onClick={() =>
+												setFinalFilters((prev) => ({
+													...prev,
+													estadoPlanilla: "TODAS",
+												}))
+											}
+											clickable
+											size="small"
+										/>
+									</Stack>
+								) : (
+									<FinalExamFiltersPanel
+										finalFilters={finalFilters}
+										setFinalFilters={setFinalFilters}
+										profesorados={profesorados}
+										ventanasFinales={ventanasFinales}
+										finalPlanes={finalPlanes}
+										finalMaterias={finalMaterias}
+										loadingFinalPlanes={loadingFinalPlanes}
+										loadingFinalMaterias={loadingFinalMaterias}
+										finalAvailableAnios={finalAvailableAnios}
+										finalCuatrimestreOptions={finalCuatrimestreOptions}
+										finalMateriasFiltradas={finalMateriasFiltradas}
+										finalError={finalError}
+										setFinalError={setFinalError}
+										finalSuccess={finalSuccess}
+										setFinalSuccess={setFinalSuccess}
+										hideEstadoFilter={isDocente}
+									/>
+								)}
+
+								<FinalExamMesasGrid
+									finalMesas={finalMesas}
+									finalSelectedMesaId={finalSelectedMesaId}
+									finalLoadingMesas={finalLoadingMesas}
+									finalLoadingPlanilla={finalLoadingPlanilla}
+									estadoPlanilla={finalFilters.estadoPlanilla}
+									onOpenFinalPlanilla={handleOpenFinalPlanilla}
+									isDocente={isDocente}
+									canPrintActas={canPrintActas}
+								/>
+							</Stack>
+						</Paper>
+
+						{finalSelectedMesaId && (() => {
+							const esPresidente = selectedMesaResumen?.mi_rol === "Presidente";
+							const esVocal = selectedMesaResumen?.mi_rol === "Vocal 1" || selectedMesaResumen?.mi_rol === "Vocal 2";
+							const fechaMesa = selectedMesaResumen?.fecha ? dayjs(selectedMesaResumen.fecha).startOf("day") : null;
+							const hoy = dayjs().startOf("day");
+							const esFechaFutura = fechaMesa ? fechaMesa.isAfter(hoy) : false;
+
+							let isMesaReadOnly = Boolean(selectedMesaResumen?.esta_cerrada);
+							let readOnlyReason = "";
+
+							if (selectedMesaResumen?.esta_cerrada) {
+								isMesaReadOnly = true;
+								readOnlyReason = "Esta mesa de examen ya se encuentra cerrada administrativamente.";
+							} else if (isDocente) {
+								if (esVocal) {
+									isMesaReadOnly = true;
+									readOnlyReason = "Usted integra el tribunal como Vocal. El acta es de solo lectura y únicamente puede ser completada y firmada por el docente Presidente.";
+								} else if (esPresidente && esFechaFutura) {
+									isMesaReadOnly = true;
+									const fechaFormateada = selectedMesaResumen?.fecha
+										? selectedMesaResumen.fecha.split("-").reverse().join("/")
+										: "";
+									readOnlyReason = `Usted es Presidente de esta mesa. La carga y modificación de calificaciones se habilitará a partir del día fijado para el examen (${fechaFormateada}).`;
+								} else if (!esPresidente && selectedMesaResumen?.puede_editar === false) {
+									isMesaReadOnly = true;
+									readOnlyReason = "No tiene permisos para modificar calificaciones en esta mesa de examen.";
+								}
+							}
+
+							return (
+								<Stack gap={3}>
+									<Paper variant="outlined" sx={{ p: { xs: 2, md: 3 } }}>
+										<ActaExamenForm
+											// Sin esto, React reutiliza la misma instancia (y su estado
+											// interno, como "ya cargué los datos del acta") al cambiar
+											// de mesa o de acta a editar — el formulario podía quedar en
+											// blanco al abrir un acta ya generada porque el efecto que
+											// vuelca los datos creía que ya se habían cargado antes.
+											key={`${finalSelectedMesaId ?? "sin-mesa"}-${finalPlanilla?.acta_id ?? "sin-acta"}`}
+											strict={!isDocente}
+											title={
+												isDocente
+													? "Carga de calificaciones de mesa"
+													: "Generar acta de examen"
+											}
+											subtitle={
+												isDocente
+													? isMesaReadOnly
+														? "Visualización de calificaciones de la mesa de examen (solo lectura)."
+														: "Complete las notas del examen final para los alumnos inscriptos."
+													: undefined
+											}
+											mesaPreseleccionada={selectedMesaResumen}
+											estudiantesPreseleccionados={finalRows.map((r) => ({
+												dni: r.dni,
+												apellido_nombre: r.apellidoNombre,
+												inscripcionId: r.inscripcionId,
+											}))}
+											editId={finalPlanilla?.acta_id || undefined}
+											readOnly={isMesaReadOnly}
+											readOnlyReason={readOnlyReason}
+											selectedOralIds={selectedOralIds}
+											onToggleOralSelection={toggleOralSelection}
+										/>
+									</Paper>
+									<Stack direction="row" justifyContent="flex-end">
+										<Button
+											variant="outlined"
+											onClick={handleDownloadAllOralActas}
+											disabled={downloadingOralBatch}
+											startIcon={
+												downloadingOralBatch ? (
+													<CircularProgress size={16} />
+												) : undefined
+											}
+										>
+											{downloadingOralBatch
+												? "Descargando..."
+												: selectedOralIds.size > 0
+													? selectedOralIds.size === 1
+														? "Descargar acta seleccionada"
+														: `Descargar ${selectedOralIds.size} actas seleccionadas (ZIP)`
+													: "Descargar todas las actas orales (ZIP)"}
+										</Button>
+									</Stack>
+								</Stack>
+							);
+						})()}
+					</Stack>
+				)}
+			</Stack>
+			<FinalConfirmationDialog
+				open={regularidadConfirmOpen}
+				onConfirm={confirmRegularidadSave}
+				onCancel={cancelRegularidadConfirm}
+				contextText="Nuevos Registros"
+				loading={saving}
+			/>
+			<FinalConfirmationDialog
+				open={finalConfirmOpen}
+				onConfirm={executeGuardarFinalPlanilla}
+				onCancel={cancelFinalConfirm}
+				contextText="Nuevos Registros"
+				loading={finalSaving}
+			/>
+			{oralDialogRow && (
+				<OralExamActaDialog
+					open
+					onClose={handleCloseOralActa}
+					estudianteNombre={oralDialogRow.apellidoNombre}
+					estudianteDni={oralDialogRow.dni}
+					carrera={selectedMesaResumen?.profesorado_nombre ?? ""}
+					unidadCurricular={
+						finalPlanilla?.materia_nombre ??
+						selectedMesaResumen?.materia_nombre ??
+						""
+					}
+					curso={selectedMesaCursoLabel}
+					fechaMesa={finalPlanilla?.fecha ?? selectedMesaResumen?.fecha ?? null}
+					tribunal={tribunalInfo}
+					existingValues={oralActDrafts[oralDialogRow.inscripcionId]}
+					defaultNota={oralDialogRow.nota}
+					loading={
+						oralActaLoading && !oralActDrafts[oralDialogRow.inscripcionId]
+					}
+					saving={oralActaSaving}
+					onSave={handleSaveOralActa}
+					mesaId={finalSelectedMesaId ?? undefined}
+					inscripcionId={oralDialogRow.inscripcionId}
+				/>
+			)}
+			<GestionComisionesDialog
+				open={gestionComisionesOpen}
+				onClose={() => setGestionComisionesOpen(false)}
+				materiaId={filters.materiaId ?? 0}
+				anioLectivo={filters.anio ?? new Date().getFullYear()}
+				materiaNombre={
+					materias.find((m) => m.id === filters.materiaId)?.nombre ?? ""
+				}
+				planId={filters.planId ?? 0}
+				anioCursada={
+					materias.find((m) => m.id === filters.materiaId)?.anio ?? 1
+				}
+			/>
+			<PlanillaRegularidadDialog
+				open={planillaOpen}
+				onClose={() => setPlanillaOpen(false)}
+				defaultProfesoradoId={filters.profesoradoId ?? undefined}
+				defaultMateriaId={filters.materiaId ?? undefined}
+				scope="standard"
+				comisionId={filters.comisionId ?? undefined}
+			/>
+		</Box>
+	);
+};
+
+export default CargaNotasPage;

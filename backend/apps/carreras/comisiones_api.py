@@ -1,0 +1,451 @@
+"""
+API para la gestión operativa de Comisiones y Cursadas.
+Permite la creación, edición y generación masiva de comisiones para materias,
+incluyendo la asignación de docentes, turnos y cupos por ciclo lectivo.
+"""
+
+import logging
+import string
+
+logger = logging.getLogger(__name__)
+
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from ninja import Router
+from ninja.errors import HttpError
+
+from core.auth_ninja import JWTAuth
+from core.models import Comision, Materia, PlanDeEstudio, Turno
+from core.permissions import (
+    allowed_profesorados,
+    ensure_profesorado_access,
+    get_user_roles,
+    require,
+)
+
+from .schemas import ComisionBulkGenerateIn, ComisionIn, ComisionOut
+
+router = Router(tags=["Comisiones"])
+
+
+def _require_manage(user):
+    """Verifica si el usuario tiene permisos de gestión académica."""
+    require(user, "editar_estructura")
+
+
+def _require_view(user):
+    """Verifica si el usuario tiene permisos de visualización académica."""
+    require(user, "ver_estructura")
+
+
+def _serialize_comision(comision: Comision) -> ComisionOut:
+    """Manual serializer para adaptar el modelo Comision al esquema de salida."""
+    return ComisionOut(
+        id=comision.id,
+        materia_id=comision.materia_id,
+        materia_nombre=comision.materia.nombre if comision.materia else None,
+        plan_id=comision.materia.plan_de_estudio_id if comision.materia else None,
+        plan_resolucion=comision.materia.plan_de_estudio.resolucion
+        if comision.materia and comision.materia.plan_de_estudio
+        else None,
+        profesorado_id=comision.materia.plan_de_estudio.profesorado_id
+        if comision.materia and comision.materia.plan_de_estudio
+        else None,
+        profesorado_nombre=comision.materia.plan_de_estudio.profesorado.nombre
+        if comision.materia and comision.materia.plan_de_estudio and comision.materia.plan_de_estudio.profesorado
+        else None,
+        anio_lectivo=comision.anio_lectivo,
+        codigo=comision.codigo,
+        turno_id=comision.turno_id,
+        turno_nombre=comision.turno.nombre if comision.turno else None,
+        docente_id=comision.docente_id,
+        docente_nombre=str(comision.docente) if comision.docente else None,
+        suplente_id=comision.suplente_id,
+        suplente_nombre=str(comision.suplente) if comision.suplente else None,
+        estado_suplente=comision.estado_suplente,
+        suplente_2_id=comision.suplente_2_id,
+        suplente_2_nombre=str(comision.suplente_2) if comision.suplente_2 else None,
+        estado_suplente_2=comision.estado_suplente_2,
+        suplente_3_id=comision.suplente_3_id,
+        suplente_3_nombre=str(comision.suplente_3) if comision.suplente_3 else None,
+        estado_suplente_3=comision.estado_suplente_3,
+        suplente_4_id=comision.suplente_4_id,
+        suplente_4_nombre=str(comision.suplente_4) if comision.suplente_4 else None,
+        estado_suplente_4=comision.estado_suplente_4,
+        horario_id=comision.horario_id,
+        cupo_maximo=comision.cupo_maximo,
+        observaciones=comision.observaciones,
+        estado=comision.estado,
+        rol=comision.rol,
+        orden=comision.orden,
+    )
+
+
+def _restrict_comisiones_queryset(user, qs):
+    """Filtra el queryset de comisiones según las carreras permitidas para el usuario."""
+    allowed = allowed_profesorados(user)
+    if allowed is not None:
+        return qs.filter(materia__plan_de_estudio__profesorado_id__in=allowed)
+    return qs
+
+
+def _codigo_from_index(index: int) -> str:
+    """
+    Convierte un índice numérico en una codificación alfabética (A, B, C... Z, AA, AB...).
+    Utilizado para identificar comisiones concurrentes de una misma materia.
+    """
+    letters = string.ascii_uppercase
+    base = len(letters)
+    result = ""
+    i = index
+    while True:
+        result = letters[i % base] + result
+        i = i // base - 1
+        if i < 0:
+            break
+    return result
+
+
+@router.get("/", response=list[ComisionOut], auth=JWTAuth())
+def list_comisiones(
+    request,
+    profesorado_id: int | None = None,
+    plan_id: int | None = None,
+    materia_id: int | None = None,
+    anio_lectivo: int | None = None,
+    turno_id: int | None = None,
+    estado: str | None = None,
+    rol: str | None = None,
+):
+    """Lista las comisiones con filtros avanzados de carrera, plan, materia y ciclo lectivo."""
+    _require_view(request.user)
+    qs = Comision.objects.select_related(
+        "materia__plan_de_estudio__profesorado",
+        "turno",
+        "docente",
+    )
+    qs = _restrict_comisiones_queryset(request.user, qs)
+
+    # Si es docente, limitar a sus propias materias/comisiones
+    active_role = request.headers.get("X-Active-Role")
+    if active_role:
+        active_role = active_role.split(":")[0].lower().strip()
+    roles = get_user_roles(request.user)
+    if active_role == "docente" or (
+        not active_role and "docente" in roles and not (roles & {"admin", "secretaria", "bedel"})
+    ):
+        qs = qs.filter(docente__persona__user_profile__user=request.user)
+
+    if profesorado_id:
+        qs = qs.filter(materia__plan_de_estudio__profesorado_id=profesorado_id)
+    if plan_id:
+        qs = qs.filter(materia__plan_de_estudio_id=plan_id)
+    if materia_id:
+        qs = qs.filter(materia_id=materia_id)
+    if anio_lectivo:
+        qs = qs.filter(anio_lectivo=anio_lectivo)
+    if turno_id:
+        qs = qs.filter(turno_id=turno_id)
+
+    if estado:
+        qs = qs.filter(estado=estado.upper())
+    if rol:
+        qs = qs.filter(rol=rol.upper())
+
+    qs = qs.order_by("-anio_lectivo", "materia__nombre", "codigo")
+    return [_serialize_comision(com) for com in qs]
+
+
+@router.post("/", response=ComisionOut, auth=JWTAuth())
+def create_comision(request, payload: ComisionIn):
+    """Crea manualmente una comisión para una materia específica.
+
+    Si ya existe una única comisión "vacante" (En Licencia o Cerrada) para la
+    misma materia/año/código, se reutiliza ese registro en vez de crear uno
+    nuevo: los estudiantes ya inscriptos están atados al id de la comisión, y
+    crear una fila aparte para el docente entrante los dejaría separados del
+    resto del grupo (ver reemplazos de docente por licencia).
+    """
+    _require_manage(request.user)
+    materia = get_object_or_404(Materia, id=payload.materia_id)
+    ensure_profesorado_access(request.user, materia.plan_de_estudio.profesorado_id)
+
+    estado = (payload.estado or Comision.Estado.ABIERTA).upper()
+
+    horario_id = payload.horario_id
+    if not horario_id:
+        from core.models import HorarioCatedra
+
+        hc = HorarioCatedra.objects.filter(espacio=materia, turno_id=payload.turno_id).first()
+        if hc:
+            horario_id = hc.id
+
+    vacantes = list(
+        Comision.objects.filter(
+            materia=materia,
+            anio_lectivo=payload.anio_lectivo,
+            codigo=payload.codigo,
+            estado__in=[Comision.Estado.LICENCIA, Comision.Estado.CERRADA],
+        )
+    )
+    if len(vacantes) == 1:
+        comision = vacantes[0]
+        docente_anterior = str(comision.docente) if comision.docente_id else None
+        comision.docente_id = payload.docente_id
+        comision.turno_id = payload.turno_id
+        comision.horario_id = horario_id
+        comision.cupo_maximo = payload.cupo_maximo
+        comision.estado = estado
+        comision.rol = (payload.rol or Comision.Rol.TITULAR).upper()
+        if payload.observaciones:
+            comision.observaciones = payload.observaciones
+        elif docente_anterior:
+            nota = f"Reemplazo de docente: sucede a {docente_anterior}."
+            comision.observaciones = f"{comision.observaciones}\n{nota}".strip() if comision.observaciones else nota
+        comision.save()
+        return _serialize_comision(comision)
+
+    comision = Comision.objects.create(
+        materia=materia,
+        anio_lectivo=payload.anio_lectivo,
+        codigo=payload.codigo,
+        turno_id=payload.turno_id,
+        docente_id=payload.docente_id,
+        horario_id=horario_id,
+        cupo_maximo=payload.cupo_maximo,
+        estado=estado,
+        rol=(payload.rol or Comision.Rol.TITULAR).upper(),
+        orden=payload.orden or 1,
+        observaciones=payload.observaciones or "",
+    )
+
+    from apps.common.audit import log_action_from_request
+
+    docente_nom = (
+        f"{comision.docente.persona.apellido}, {comision.docente.persona.nombre}"
+        if (comision.docente and comision.docente.persona)
+        else "Sin docente"
+    )
+    log_action_from_request(
+        request,
+        accion="CREATE",
+        tipo_accion="CRUD",
+        detalle_accion=f"Creó comisión {comision.codigo} en {materia.nombre} ({docente_nom})",
+        entidad="Comision",
+        entidad_id=comision.id,
+        after={
+            "comision_id": comision.id,
+            "materia": materia.nombre,
+            "codigo": comision.codigo,
+            "anio_lectivo": comision.anio_lectivo,
+            "docente": docente_nom,
+            "estado": comision.estado,
+        },
+    )
+
+    return _serialize_comision(comision)
+
+
+@router.put("/{comision_id}", response=ComisionOut, auth=JWTAuth())
+def update_comision(request, comision_id: int, payload: ComisionIn):
+    """Actualiza la configuración (docente, turno, cupo) de una comisión."""
+    _require_manage(request.user)
+    comision = get_object_or_404(
+        Comision.objects.select_related(
+            "docente__persona", "suplente__persona", "suplente_2__persona", "materia", "turno"
+        ),
+        id=comision_id,
+    )
+    ensure_profesorado_access(request.user, comision.materia.plan_de_estudio.profesorado_id)
+
+    doc_tit_antes = (
+        f"{comision.docente.persona.apellido}, {comision.docente.persona.nombre}"
+        if (comision.docente and comision.docente.persona)
+        else "Ninguno"
+    )
+    doc_sup_antes = (
+        f"{comision.suplente.persona.apellido}, {comision.suplente.persona.nombre}"
+        if (comision.suplente and comision.suplente.persona)
+        else "Ninguno"
+    )
+    before_state = {
+        "comision_id": comision.id,
+        "materia": comision.materia.nombre,
+        "codigo": comision.codigo,
+        "docente_titular": doc_tit_antes,
+        "docente_suplente": doc_sup_antes,
+        "estado": comision.estado,
+        "turno": comision.turno.nombre if comision.turno else "",
+        "cupo_maximo": comision.cupo_maximo,
+    }
+
+    for attr, value in payload.dict(exclude_unset=True).items():
+        setattr(comision, attr, value)
+
+    if not comision.horario_id:
+        from core.models import HorarioCatedra
+
+        hc = HorarioCatedra.objects.filter(espacio=comision.materia_id, turno_id=comision.turno_id).first()
+        if hc:
+            comision.horario = hc
+
+    comision.save()
+    comision.refresh_from_db()
+
+    doc_tit_despues = (
+        f"{comision.docente.persona.apellido}, {comision.docente.persona.nombre}"
+        if (comision.docente and comision.docente.persona)
+        else "Ninguno"
+    )
+    doc_sup_despues = (
+        f"{comision.suplente.persona.apellido}, {comision.suplente.persona.nombre}"
+        if (comision.suplente and comision.suplente.persona)
+        else "Ninguno"
+    )
+    after_state = {
+        "comision_id": comision.id,
+        "materia": comision.materia.nombre,
+        "codigo": comision.codigo,
+        "docente_titular": doc_tit_despues,
+        "docente_suplente": doc_sup_despues,
+        "estado": comision.estado,
+        "turno": comision.turno.nombre if comision.turno else "",
+        "cupo_maximo": comision.cupo_maximo,
+    }
+
+    from apps.common.audit import log_action_from_request
+
+    log_action_from_request(
+        request,
+        accion="UPDATE",
+        tipo_accion="CRUD",
+        detalle_accion=f"Modificó cátedra/comisión {comision.codigo} de {comision.materia.nombre} ({doc_tit_antes} -> {doc_tit_despues})",
+        entidad="Comision",
+        entidad_id=comision.id,
+        before=before_state,
+        after=after_state,
+    )
+
+    return _serialize_comision(comision)
+
+
+@router.post("/generar", response=list[ComisionOut], auth=JWTAuth())
+def bulk_generate_comisiones(request, payload: ComisionBulkGenerateIn):
+    """
+    Generación automática y masiva de comisiones para todo un plan de estudios.
+
+    Flujo:
+    1. Identifica todas las materias del plan.
+    2. Crea N comisiones para cada materia (si no existen aún).
+    3. Asigna códigos secuenciales (A, B, C...) y rota los turnos disponibles.
+    """
+    _require_manage(request.user)
+    if payload.cantidad < 1:
+        raise HttpError(400, "La cantidad de comisiones por materia debe ser al menos 1.")
+
+    plan = get_object_or_404(PlanDeEstudio.objects.select_related("profesorado"), id=payload.plan_id)
+    ensure_profesorado_access(request.user, plan.profesorado_id)
+
+    materias = list(plan.materias.all().order_by("anio_cursada", "nombre"))
+    if not materias:
+        raise HttpError(400, "El plan seleccionado no posee materias registradas.")
+
+    estado = (payload.estado or Comision.Estado.ABIERTA).upper()
+
+    # Selección de turnos para rotación automática
+    if payload.turnos:
+        turnos = list(Turno.objects.filter(id__in=payload.turnos))
+        if not turnos:
+            raise HttpError(400, "No se encontraron los turnos especificados.")
+    else:
+        turnos = list(Turno.objects.all().order_by("id"))
+        if not turnos:
+            raise HttpError(400, "Debe existir al menos un turno cargado en el sistema.")
+
+    created: list[Comision] = []
+    with transaction.atomic():
+        for materia in materias:
+            # Auditamos códigos existentes para evitar duplicados en el mismo ciclo
+            existing_codes = set(
+                Comision.objects.filter(
+                    materia=materia,
+                    anio_lectivo=payload.anio_lectivo,
+                ).values_list("codigo", flat=True)
+            )
+
+            existentes = len(existing_codes)
+            if existentes >= payload.cantidad:
+                continue
+
+            faltantes = payload.cantidad - existentes
+            code_index = 0
+            nuevos_creados = 0
+
+            # Generamos comisiones hasta alcanzar la cantidad deseada
+            while nuevos_creados < faltantes:
+                codigo = _codigo_from_index(code_index)
+                code_index += 1
+                if codigo in existing_codes:
+                    continue
+
+                existing_codes.add(codigo)
+                # Rotación de turnos basada en la cantidad de comisiones
+                turno = turnos[(existentes + nuevos_creados) % len(turnos)]
+
+                from core.models import HorarioCatedra
+
+                hc = HorarioCatedra.objects.filter(espacio=materia, turno=turno).first()
+
+                comision = Comision.objects.create(
+                    materia=materia,
+                    anio_lectivo=payload.anio_lectivo,
+                    codigo=codigo,
+                    turno=turno,
+                    estado=estado,
+                    horario=hc,
+                    observaciones="",
+                )
+                created.append(comision)
+                nuevos_creados += 1
+
+    return [_serialize_comision(com) for com in created]
+
+
+@router.delete("/{comision_id}", response={204: None}, auth=JWTAuth())
+def delete_comision(request, comision_id: int):
+    """Elimina una comisión. Precaución: puede afectar inscripciones existentes."""
+    _require_manage(request.user)
+    comision = get_object_or_404(
+        Comision.objects.select_related("materia", "docente__persona", "turno"),
+        id=comision_id,
+    )
+    ensure_profesorado_access(request.user, comision.materia.plan_de_estudio.profesorado_id)
+
+    doc_tit = (
+        f"{comision.docente.persona.apellido}, {comision.docente.persona.nombre}"
+        if (comision.docente and comision.docente.persona)
+        else "Ninguno"
+    )
+    before_state = {
+        "comision_id": comision.id,
+        "materia": comision.materia.nombre,
+        "codigo": comision.codigo,
+        "anio_lectivo": comision.anio_lectivo,
+        "docente": doc_tit,
+        "turno": comision.turno.nombre if comision.turno else "",
+    }
+
+    from apps.common.audit import log_action_from_request
+
+    log_action_from_request(
+        request,
+        accion="DELETE",
+        tipo_accion="CRUD",
+        detalle_accion=f"Eliminó comisión {comision.codigo} de {comision.materia.nombre} (Docente: {doc_tit})",
+        entidad="Comision",
+        entidad_id=comision.id,
+        before=before_state,
+    )
+
+    comision.delete()
+    return 204, None

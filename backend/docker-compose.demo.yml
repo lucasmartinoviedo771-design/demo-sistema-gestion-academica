@@ -1,0 +1,87 @@
+# Instancia pública de DEMO (portafolio) con datos 100% ficticios.
+#
+# Totalmente separada de DEV y de producción: otro nombre de proyecto, otros
+# contenedores, otra base y otros volúmenes. Solo el frontend publica un
+# puerto, y únicamente en localhost (lo expone el Cloudflare Tunnel).
+#
+# Uso (desde backend/):
+#   docker compose -f docker-compose.demo.yml --env-file .env.demo up -d --build
+#   docker compose -f docker-compose.demo.yml --env-file .env.demo exec backend \
+#       /app/.venv/bin/python manage.py seed_demo --reset --yes
+
+name: ipes6-demo
+
+services:
+  db:
+    container_name: ipes6-demo-db
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "mysqladmin ping -h localhost -p$$MYSQL_ROOT_PASSWORD || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    environment:
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - demo_db_data:/var/lib/mysql
+
+  redis:
+    container_name: ipes6-demo-redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    container_name: ipes6-demo-backend
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.demo
+    environment:
+      DEMO_MODE: "true"
+      REDIS_URL: redis://redis:6379/1
+      DB_HOST: db
+      DB_PORT: "3306"
+      SECURE_SSL_REDIRECT: "False"
+    command: /app/.venv/bin/gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 120
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - demo_static:/app/staticfiles
+      - demo_media:/app/media
+      - ../logs/backend:/app/logs
+
+  frontend:
+    container_name: ipes6-demo-frontend
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:8095:80"
+    volumes:
+      - demo_static:/app/staticfiles
+      - demo_media:/app/media
+
+volumes:
+  demo_db_data:
+  demo_static:
+  demo_media:

@@ -1,0 +1,153 @@
+{% extends "core/pdf_base.html" %}
+
+{% block page_size %}size: A4; margin: 5mm 15mm 18mm 15mm;{% endblock %}
+{% block page_numbers %}{% endblock %}
+
+{% block extra_style %}
+  <style>
+    body {
+      font-family: "Helvetica", Arial, sans-serif;
+      font-size: 10pt;
+      line-height: 1.3;
+      color: #000;
+      margin: 0;
+      padding: 0;
+    }
+
+    .certificate-container {
+      height: 136mm;
+      width: 100%;
+      position: relative;
+      box-sizing: border-box;
+      overflow: hidden;
+      padding-top: 3mm;
+    }
+
+    /* Línea de corte entre las dos copias */
+    .certificate-container:first-child {
+      border-bottom: 1px dashed #bbb;
+      margin-bottom: 2mm;
+    }
+
+    .title {
+      text-align: center;
+      font-weight: bold;
+      font-size: 11pt;
+      text-decoration: underline;
+      margin: 12pt 0 12pt 0;
+      text-transform: uppercase;
+    }
+
+    .cert-content {
+      text-align: justify;
+      line-height: 1.5;
+      margin-bottom: 12pt;
+      font-size: 10.5pt;
+    }
+
+    .cert-content p {
+      margin-bottom: 10pt;
+      text-indent: 25pt;
+    }
+
+    .highlight {
+      font-weight: bold;
+    }
+
+    .footer-signatures {
+      width: 100%;
+      margin-top: 10pt;
+    }
+
+    .signature-cell {
+      width: 33.33%;
+      text-align: center;
+      vertical-align: top;
+    }
+
+    .signature-line {
+      border-top: 1px dashed #000;
+      width: 85%;
+      margin: 0 auto;
+      padding-top: 3pt;
+      font-size: 7.5pt;
+      font-weight: bold;
+      text-transform: uppercase;
+    }
+
+    .malvinas-legend {
+      text-align: center;
+      font-size: 7.5pt;
+      font-style: italic;
+      color: #555;
+      margin-top: 10pt;
+      width: 100%;
+    }
+
+    @page {
+      @bottom-center { content: none; }
+    }
+  </style>
+{% endblock %}
+
+{# El header/footer del base se suprime — cada copia incluye los suyos propios #}
+{% block header %}{% endblock %}
+{% block footer %}{% endblock %}
+
+{% block content %}
+  {% for i in "12" %}
+  <div class="certificate-container">
+
+    {% include "core/pdf_header.html" %}
+
+    <div class="title">CONSTANCIA DE ALUMNO REGULAR</div>
+
+    <div class="cert-content">
+      <p>
+        El <span class="highlight">Instituto Superior Demo</span>,
+        sito en la calle José Manuel ESTRADA N° 1575 de la Ciudad de Río Grande,
+        Provincia Demo – CUE N° 0000000-00 –
+        CERTIFICA que el/la estudiante
+        {% comment %}
+        Persona es la fuente de verdad de identidad (ver CLAUDE.md, decisión P-1) —
+        usuario.last_name/first_name (auth.User) están obsoletos y pueden tener
+        datos históricos incompletos/sucios.
+        {% endcomment %}
+        <span class="highlight">{{ estudiante.apellido|upper }}, {{ estudiante.nombre|upper }}</span>,
+        D.N.I. N° <span class="highlight">{{ estudiante.dni }}</span>,
+        cursa sus estudios regularmente en
+        <span class="highlight">{{ anio_estudio }}° Año</span>
+        del <span class="highlight">{{ profesorado.nombre }} – {{ resolucion_plan }}</span>.
+      </p>
+      <p>
+        Se expide la presente, sin enmiendas ni raspaduras, a pedido del/la interesado/a y a solo efecto
+        de ser presentada ante {{ destinatario|default:"quien corresponda" }}, a los {{ fecha.day }} días del mes de
+        {{ fecha|date:"F"|lower }} del año {{ fecha.year }},
+        en Ciudad Demo.
+      </p>
+    </div>
+
+    <table class="footer-signatures">
+      <tr>
+        <td class="signature-cell">
+          <div style="height: 22pt;"></div>
+          <div class="signature-line">FIRMA BEDEL</div>
+        </td>
+        <td class="signature-cell">
+          <div style="height: 22pt;"></div>
+          <div class="signature-line">SELLO INSTITUCIONAL</div>
+        </td>
+        <td class="signature-cell">
+          <div style="height: 22pt;"></div>
+          <div class="signature-line">FIRMA AUTORIDAD</div>
+        </td>
+      </tr>
+    </table>
+
+    <div class="malvinas-legend">
+      "Las Islas Malvinas, Georgias, Sándwich del Sur y los Hielos Continentales, son y serán Argentinas"
+    </div>
+
+  </div>
+  {% endfor %}
+{% endblock %}

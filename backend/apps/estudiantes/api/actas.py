@@ -1,0 +1,1355 @@
+"""
+API de Gestión de Actas de Examen.
+Permite la carga, consulta y rectificación de actas de examen finales (Regulares y Libres).
+Incluye lógica crítica para la sincronización de resultados con la Trayectoria Académica,
+creación automatizada de legajos para carga de datos históricos y validación de consistencia
+contra Mesas de Examen activas.
+"""
+
+import secrets
+import uuid
+from datetime import datetime
+from decimal import Decimal
+
+from django.db import models, transaction
+from django.http import HttpResponse
+from django.utils import timezone
+from ninja import Body, Router
+
+from apps.common.api_schemas import ApiResponse
+from apps.common.audit import log_action_from_request, snapshot
+from apps.common.date_utils import format_date, format_datetime
+from apps.estudiantes.api.actas_helpers import (
+    LIBRO_DIGITAL,
+    _acta_metadata,
+    _clasificar_resultado,
+    _compute_acta_codigo,
+    _next_acta_numero,
+    _nota_label,
+    clave_registral_digital,
+    generar_folio_digital,
+)
+from apps.estudiantes.api.actas_schemas import (
+    ActaCreateLocal,
+    ActaCreateOutLocal,
+    ActaDetailLocal,
+    ActaDocenteLocal,
+    ActaEstudianteLocal,
+    ActaListItem,
+    ActaMetadataOut,
+    BorradorActaFinalPayload,
+)
+from apps.estudiantes.services.actas_pdf import generar_acta_examen_pdf
+from apps.estudiantes.services.cursada import estudiante_tiene_materia_aprobada
+from apps.primera_carga.audit_utils import verify_acta_consistency
+from core.auth_ninja import JWTAuth
+from core.models import (
+    ActaExamen,
+    ActaExamenDocente,
+    ActaExamenEstudiante,
+    Docente,
+    Estudiante,
+    InscripcionMesa,
+    Materia,
+    MesaExamen,
+    Profesorado,
+)
+from core.permissions import can, ensure_profesorado_access, requires, requires_any
+
+from .notas_utils import format_user_display
+
+router = Router(tags=["actas"])
+
+
+def _validar_examen_oral_tiene_acta(mesa, estudiantes) -> str | None:
+    """
+    Si un estudiante tiene nota cargada en "Examen oral" en el acta final,
+    debe existir su acta oral (MesaActaOral) guardada y con nota — para que
+    no se cargue la nota de memoria/de palabra sin haber generado el acta
+    oral correspondiente. Aplica a ordinarias y extraordinarias, libres y
+    regulares por igual (no depende del tipo/modalidad de la mesa).
+
+    Devuelve el mensaje de error si falta, o None si está todo bien o no
+    hay mesa vinculada (carga manual sin mesa, donde no hay cómo verificar
+    esto).
+    """
+    if not mesa:
+        return None
+
+    from core.models import InscripcionMesa, MesaActaOral
+
+    for est_item in estudiantes:
+        examen_oral = (est_item.examen_oral or "").strip()
+        if not examen_oral:
+            continue
+        dni = (est_item.dni or "").strip()
+        if not dni:
+            continue
+
+        insc = InscripcionMesa.objects.filter(mesa=mesa, estudiante__persona__dni=dni).first()
+        if not insc:
+            continue
+
+        acta_oral = MesaActaOral.objects.filter(inscripcion=insc).first()
+        if not acta_oral or not (acta_oral.nota_final or "").strip():
+            nombre = est_item.apellido_nombre or dni
+            return (
+                f"{nombre} tiene nota de examen oral cargada, pero no tiene el acta oral "
+                "generada (o está vacía). Cargue el acta oral de ese estudiante antes de "
+                "guardar el acta final."
+            )
+    return None
+
+
+@router.get(
+    "/actas/metadata",
+    response={200: ApiResponse},
+    auth=JWTAuth(),
+)
+@requires_any("ver_actas", "carga_finales")
+def obtener_acta_metadata(request):
+    """
+    Retorna metadatos auxiliares para la carga de actas (Carreras, Planes, Roles).
+
+    Admite también 'carga_finales' porque el docente a cargo de una mesa necesita
+    este catálogo para cargar las notas: sin él el formulario no puede renderizarse.
+    No expone actas, y el acceso a cada acta/planilla se valida por separado.
+    """
+    data = _acta_metadata(user=request.user)
+    return ApiResponse(
+        ok=True,
+        message="Metadata para actas de examen.",
+        data=data.dict(),
+    )
+
+
+@router.get(
+    "/actas",
+    response={200: list[ActaListItem]},
+    auth=JWTAuth(),
+)
+@requires("ver_actas")
+def listar_actas(
+    request,
+    anio: int | None = None,  # type: ignore
+    materia: str | None = None,  # type: ignore
+    libro: str | None = None,  # type: ignore
+    folio: str | None = None,  # type: ignore
+    anio_cursada_materia: int | None = None,  # type: ignore
+    incluir_equivalencias: bool = False,
+    ordering: str = "-id",
+    sin_tribunal: bool = False,
+    profesorado_id: int | None = None,  # type: ignore
+):
+    """
+    Lista actas de examen con filtros por Libro, Folio y Materia.
+    Implementa control de acceso territorial (Bedeles solo ven sus carreras).
+    """
+    user = request.user
+    if can(user, "cargar_equivalencias_titulos"):
+        qs = ActaExamen.objects.all()
+    else:
+        from core.models import StaffAsignacion
+
+        carreras_ids = StaffAsignacion.objects.filter(user=user).values_list("profesorado_id", flat=True)
+        qs = ActaExamen.objects.filter(profesorado_id__in=carreras_ids)
+
+    if not incluir_equivalencias:
+        qs = qs.exclude(codigo__startswith="EQUIV-")
+
+    if anio:
+        qs = qs.filter(fecha__year=anio)
+    if materia:
+        qs = qs.filter(materia__nombre__icontains=materia)
+    if libro:
+        qs = qs.filter(libro__icontains=libro)
+    if folio:
+        qs = qs.filter(folio__icontains=folio)
+    if anio_cursada_materia:
+        qs = qs.filter(materia__anio_cursada=anio_cursada_materia)
+    if profesorado_id:
+        qs = qs.filter(profesorado_id=profesorado_id)
+    if sin_tribunal:
+        from django.db.models import Exists, OuterRef
+
+        tiene_vocal = ActaExamenDocente.objects.filter(acta=OuterRef("pk"), rol__in=["VOC1", "VOC2"])
+        qs = qs.filter(~Exists(tiene_vocal))
+
+    # Limitar longitud de parámetros de búsqueda
+    materia = (materia or "")[:100]
+    libro = (libro or "")[:50]
+    folio = (folio or "")[:20]
+
+    has_filters = any([anio, materia, libro, folio, anio_cursada_materia, profesorado_id])
+    limit = 200 if has_filters else 50
+
+    allowed_ordering = [
+        "id",
+        "-id",
+        "fecha",
+        "-fecha",
+        "materia__nombre",
+        "-materia__nombre",
+        "total_alumnos",
+        "-total_alumnos",
+    ]
+    if ordering not in allowed_ordering:
+        ordering = "-id"
+
+    from django.db.models import Exists, OuterRef
+
+    tiene_vocal_sub = ActaExamenDocente.objects.filter(acta=OuterRef("pk"), rol__in=["VOC1", "VOC2"])
+    actas_list = list(
+        qs.select_related("materia").annotate(tiene_vocales=Exists(tiene_vocal_sub)).order_by(ordering)[:limit]
+    )
+
+    # Prefetch de estados de cierre de mesas correspondientes
+    materia_ids = {a.materia_id for a in actas_list}  # type: ignore
+    fechas = {a.fecha for a in actas_list if a.fecha}
+    mesa_lookup: dict[tuple, MesaExamen] = {}
+    if materia_ids and fechas:
+        for mesa in MesaExamen.objects.filter(materia_id__in=materia_ids, fecha__in=fechas):
+            key = (mesa.materia_id, mesa.fecha, mesa.modalidad)  # type: ignore
+            mesa_lookup[key] = mesa
+
+    result = []
+    for acta in actas_list:
+        mesa: MesaExamen | None = mesa_lookup.get((acta.materia_id, acta.fecha, acta.tipo))  # type: ignore
+        result.append(
+            {
+                "id": acta.id,  # type: ignore
+                "codigo": acta.codigo,
+                "fecha": acta.fecha.isoformat() if acta.fecha else None,
+                "materia": acta.materia.nombre if acta.materia else "Desconocida",
+                "libro": acta.libro,
+                "folio": acta.folio,
+                "total_estudiantes": acta.total_alumnos,
+                "created_at": format_datetime(acta.created_at),
+                "mesa_id": mesa.id if mesa else None,  # type: ignore
+                "esta_cerrada": (mesa.planilla_cerrada_en is not None) if mesa else False,
+                "tiene_vocales": acta.tiene_vocales,  # type: ignore
+            }
+        )
+    return result
+
+
+@router.get(
+    "/actas/{acta_id}",
+    response={200: ActaDetailLocal, 404: ApiResponse, 403: ApiResponse},
+    auth=JWTAuth(),
+)
+@requires_any("ver_actas", "carga_finales")
+def obtener_acta(request, acta_id: int):
+    """Obtiene el detalle completo de un acta, incluyendo nómina de alumnos y tribunal docente.
+
+    Admite también 'carga_finales' porque el docente presidente de la mesa
+    necesita poder reabrir/editar el acta que él mismo generó (desde la
+    tarjeta "Cargar/Editar acta" en su panel) — 'ver_actas' deliberadamente
+    no incluye "docente" (esa capability es para secretaría/bedelía/etc con
+    acceso territorial amplio), así que el alcance de un docente se valida
+    acá aparte: solo si integra el tribunal de la mesa de esa acta.
+    """
+    acta = ActaExamen.objects.select_related("materia", "profesorado", "created_by", "plan").filter(id=acta_id).first()
+    if not acta:
+        return 404, ApiResponse(ok=False, message="Acta no encontrada.")
+
+    mesa = MesaExamen.objects.filter(materia_id=acta.materia_id, fecha=acta.fecha, modalidad=acta.tipo).first()  # type: ignore
+
+    # Verificación de permisos territoriales
+    user = request.user
+    from core.permissions import get_user_roles
+
+    user_roles = get_user_roles(user)
+    # OJO: "docente" está incluido en la capability "acta_manual" (junto con
+    # admin/secretaria/bedel), así que "not can(user, 'acta_manual')" NO sirve
+    # acá para distinguir "es solo docente" — daría False incluso para un
+    # docente puro. Se usa en cambio el mismo criterio explícito de
+    # admin/secretaria que ya usa _check_acta_oral_access en actas_orales.py,
+    # para que un admin o secretaria con rol docente adicional (doble rol) no
+    # quede acotado al chequeo de tribunal de abajo.
+    is_global_admin = user.is_superuser or bool(user_roles & {"admin", "secretaria"})
+    is_docente_only = "docente" in user_roles and not is_global_admin
+
+    if is_docente_only:
+        from apps.estudiantes.api.helpers.user_utils import _resolve_docente_from_user
+
+        docente_actual = _resolve_docente_from_user(user)
+        es_tribunal = bool(
+            docente_actual
+            and mesa
+            and docente_actual.id in (mesa.docente_presidente_id, mesa.docente_vocal1_id, mesa.docente_vocal2_id)
+        )
+        if not es_tribunal:
+            return 403, ApiResponse(ok=False, message="No integra el tribunal de la mesa de esta acta.")
+    elif not can(user, "cargar_equivalencias_titulos"):
+        from core.models import StaffAsignacion
+
+        carreras_ids = StaffAsignacion.objects.filter(user=user).values_list("profesorado_id", flat=True)
+        if acta.profesorado_id not in carreras_ids:  # type: ignore
+            return 403, ApiResponse(ok=False, message="No tiene permiso para ver actas de este profesorado.")
+
+    estudiantes_qs = acta.estudiantes.all().order_by("numero_orden")  # type: ignore
+    estudiantes_list = [
+        ActaEstudianteLocal(
+            numero_orden=a.numero_orden,
+            permiso_examen=a.permiso_examen,
+            dni=a.dni,
+            apellido_nombre=a.apellido_nombre,
+            examen_escrito=a.examen_escrito,
+            examen_oral=a.examen_oral,
+            calificacion_definitiva=a.calificacion_definitiva,
+            observaciones=a.observaciones,
+        )
+        for a in estudiantes_qs
+    ]
+
+    docentes_qs = acta.docentes.all().order_by("orden")  # type: ignore
+    docentes_list = [
+        ActaDocenteLocal(docente_id=a.docente_id, nombre=a.nombre, dni=a.dni, rol=a.rol) for a in docentes_qs
+    ]
+
+    return ActaDetailLocal(
+        id=acta.id,  # type: ignore
+        codigo=acta.codigo,
+        fecha=format_date(acta.fecha),  # type: ignore
+        tipo=acta.tipo,
+        profesorado_id=acta.profesorado_id,  # type: ignore
+        materia_id=acta.materia_id,  # type: ignore
+        plan_id=acta.plan_id,  # type: ignore
+        profesorado=acta.profesorado.nombre,
+        materia=acta.materia.nombre if acta.materia else "Desconocida",
+        materia_anio=acta.materia.anio_cursada if acta.materia else None,
+        plan_resolucion=acta.plan.resolucion if acta.plan else None,
+        libro=acta.libro,
+        folio=acta.folio,
+        observaciones=acta.observaciones,
+        total_estudiantes=acta.total_alumnos,
+        total_aprobados=acta.total_aprobados or 0,
+        total_desaprobados=acta.total_desaprobados or 0,
+        total_ausentes=acta.total_ausentes or 0,
+        created_by=format_user_display(acta.created_by),
+        created_at=format_datetime(acta.created_at),
+        mesa_id=mesa.id if mesa else None,  # type: ignore
+        esta_cerrada=(mesa.planilla_cerrada_en is not None) if mesa else False,
+        estudiantes=estudiantes_list,
+        docentes=docentes_list,
+    )
+
+
+def _check_acta_final_write_access(user, mesa: MesaExamen | None) -> tuple[bool, str | None]:
+    """
+    Chequeo de permisos para guardar un borrador de acta final de una mesa.
+    Deliberadamente más laxo que crear_acta_examen: sin la restricción de
+    fecha (guardar un avance antes del día de la mesa es inofensivo), pero
+    respeta el mismo criterio de "quién puede tocar esta mesa" (presidente
+    del tribunal, o admin/secretaría/staff con alcance).
+    Devuelve (puede_escribir, mensaje_error_si_no).
+    """
+    from core.permissions import can, get_user_roles
+
+    user_roles = get_user_roles(user)
+    is_docente_only = "docente" in user_roles and not can(user, "acta_manual")
+
+    if not is_docente_only:
+        return True, None
+
+    if not can(user, "carga_notas"):
+        return False, "No tiene permisos para cargar notas."
+
+    if not mesa:
+        return True, None
+
+    docente_obj = Docente.objects.filter(persona__user_profile__user=user).first()
+    if not docente_obj or docente_obj.id != mesa.docente_presidente_id:
+        return False, "Solo el docente presidente de la mesa puede guardar avances del acta."
+    return True, None
+
+
+@router.get(
+    "/actas/mesas/{mesa_id}/borrador",
+    response={200: BorradorActaFinalPayload, 403: ApiResponse, 404: ApiResponse},
+    auth=JWTAuth(),
+)
+def obtener_borrador_acta_final(request, mesa_id: int):
+    """Recupera el último avance guardado (aún no generado) del acta final de una mesa."""
+    from core.models import BorradorActaFinal
+
+    mesa = MesaExamen.objects.filter(id=mesa_id).first()
+    if not mesa:
+        return 404, ApiResponse(ok=False, message="Mesa no encontrada.")
+
+    puede, error = _check_acta_final_write_access(request.user, mesa)
+    if not puede:
+        return 403, ApiResponse(ok=False, message=error)
+
+    borrador = BorradorActaFinal.objects.filter(mesa_id=mesa_id, activo=True).first()
+    if not borrador:
+        return 404, ApiResponse(ok=False, message="No hay borrador guardado para esta mesa.")
+
+    estudiantes = []
+    for i, linea in enumerate(borrador.estudiantes_csv.splitlines()):
+        if not linea.strip():
+            continue
+        partes = (linea.split("|") + [""] * 9)[:9]
+        (
+            dni,
+            apellido_nombre,
+            numero_orden,
+            permiso_examen,
+            examen_escrito,
+            examen_oral,
+            calificacion_definitiva,
+            observaciones,
+            inscripcion_id,
+        ) = partes
+        estudiantes.append(
+            {
+                "numero_orden": int(numero_orden) if numero_orden.isdigit() else i + 1,
+                "permiso_examen": permiso_examen or None,
+                "dni": dni or None,
+                "apellido_nombre": apellido_nombre or None,
+                "examen_escrito": examen_escrito or None,
+                "examen_oral": examen_oral or None,
+                "calificacion_definitiva": calificacion_definitiva or None,
+                "observaciones": observaciones or None,
+                "inscripcion_id": int(inscripcion_id) if inscripcion_id.isdigit() else None,
+            }
+        )
+
+    docentes = []
+    for rol, nombre, dni in (
+        ("PRES", borrador.docente_presidente_nombre, borrador.docente_presidente_dni),
+        ("VOC1", borrador.docente_vocal1_nombre, borrador.docente_vocal1_dni),
+        ("VOC2", borrador.docente_vocal2_nombre, borrador.docente_vocal2_dni),
+    ):
+        if nombre:
+            docentes.append({"rol": rol, "docente_id": None, "nombre": nombre, "dni": dni or None})
+
+    return BorradorActaFinalPayload(
+        folio=borrador.folio or None,
+        libro=borrador.libro or None,
+        observaciones=borrador.observaciones_generales or None,
+        docentes=docentes,
+        estudiantes=estudiantes,
+    )
+
+
+@router.post(
+    "/actas/mesas/{mesa_id}/borrador",
+    response={200: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+    auth=JWTAuth(),
+)
+def guardar_borrador_acta_final(request, mesa_id: int, payload: BorradorActaFinalPayload = Body(...)):
+    """
+    Guarda el avance del acta final de una mesa SIN generarla — permite que
+    el docente cambie de mesa o de PC mientras va cargando notas y retome
+    después sin perder lo ya tipeado. No valida que esté completa.
+    """
+    from core.models import BorradorActaFinal
+
+    mesa = MesaExamen.objects.filter(id=mesa_id).first()
+    if not mesa:
+        return 404, ApiResponse(ok=False, message="Mesa no encontrada.")
+
+    puede, error = _check_acta_final_write_access(request.user, mesa)
+    if not puede:
+        return 403, ApiResponse(ok=False, message=error)
+
+    def _safe(val: str | None) -> str:
+        return (val or "").replace("|", "/").replace("\n", " ")
+
+    lineas = []
+    for e in payload.estudiantes:
+        lineas.append(
+            "|".join(
+                [
+                    _safe(e.dni),
+                    _safe(e.apellido_nombre),
+                    str(e.numero_orden),
+                    _safe(e.permiso_examen),
+                    _safe(e.examen_escrito),
+                    _safe(e.examen_oral),
+                    _safe(e.calificacion_definitiva),
+                    _safe(e.observaciones),
+                    str(e.inscripcion_id) if e.inscripcion_id else "",
+                ]
+            )
+        )
+
+    docentes_por_rol = {d.rol: d for d in payload.docentes}
+    presidente = docentes_por_rol.get("PRES")
+    vocal1 = docentes_por_rol.get("VOC1")
+    vocal2 = docentes_por_rol.get("VOC2")
+
+    BorradorActaFinal.objects.update_or_create(
+        mesa_id=mesa_id,
+        defaults={
+            "folio": payload.folio or "",
+            "libro": payload.libro or "",
+            "observaciones_generales": payload.observaciones or "",
+            "docente_presidente_nombre": presidente.nombre if presidente else "",
+            "docente_presidente_dni": (presidente.dni or "") if presidente else "",
+            "docente_vocal1_nombre": vocal1.nombre if vocal1 else "",
+            "docente_vocal1_dni": (vocal1.dni or "") if vocal1 else "",
+            "docente_vocal2_nombre": vocal2.nombre if vocal2 else "",
+            "docente_vocal2_dni": (vocal2.dni or "") if vocal2 else "",
+            "estudiantes_csv": "\n".join(lineas),
+            "activo": True,
+            "guardado_por": request.user,
+        },
+    )
+
+    return 200, ApiResponse(ok=True, message="Avance guardado.")
+
+
+@router.post(
+    "/actas",
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+    auth=JWTAuth(),
+)
+def crear_acta_examen(request, payload: ActaCreateLocal = Body(...)):
+    """
+    Crea un acta de examen y sincroniza los resultados con las inscripciones a mesa.
+    """
+    from datetime import date
+
+    from core.permissions import can, get_user_roles, require
+
+    user_roles = get_user_roles(request.user)
+    is_docente_only = "docente" in user_roles and not can(request.user, "acta_manual")
+
+    if is_docente_only:
+        require(request.user, "carga_notas")
+    else:
+        require(request.user, "acta_manual")
+
+    NOTA_NUMERIC_VALUES = [str(i) for i in range(1, 11)]
+    ACTA_NOTA_CHOICES = NOTA_NUMERIC_VALUES + [
+        ActaExamenEstudiante.NOTA_AUSENTE_JUSTIFICADO,
+        ActaExamenEstudiante.NOTA_AUSENTE_INJUSTIFICADO,
+    ]
+
+    # Resolución de fecha
+    try:
+        acta_fecha = datetime.strptime(payload.fecha, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        try:
+            acta_fecha = datetime.fromisoformat(payload.fecha).date()
+        except ValueError:
+            return 400, ApiResponse(ok=False, message="Formato de fecha inválido. Use YYYY-MM-DD")
+
+    try:
+        profesorado = Profesorado.objects.get(pk=payload.profesorado_id)
+        if not is_docente_only:
+            ensure_profesorado_access(request.user, profesorado.id)
+    except Profesorado.DoesNotExist:
+        return 404, ApiResponse(ok=False, message="Profesorado no encontrado.")
+
+    # Resolución de mesa
+    mesa = None
+    if payload.mesa_id:
+        mesa = MesaExamen.objects.filter(id=payload.mesa_id).first()
+        if not mesa:
+            return 404, ApiResponse(ok=False, message="Mesa de examen no encontrada.")
+
+    # Si es solo docente, verificar tribunal y fecha
+    if is_docente_only:
+        try:
+            docente_obj = Docente.objects.get(persona__user_profile__user=request.user)
+            if mesa:
+                # Solo el presidente de la mesa puede cargar las notas
+                if docente_obj.id != mesa.docente_presidente_id:
+                    return 403, ApiResponse(
+                        ok=False,
+                        message="Solo el docente presidente de la mesa puede generar el acta. Los vocales tienen acceso de solo lectura.",
+                    )
+                # No se permite cargar antes del día de la mesa
+                if mesa.fecha > date.today():
+                    return 403, ApiResponse(
+                        ok=False,
+                        message=f"No se pueden cargar calificaciones antes de la fecha fijada para la mesa ({mesa.fecha.strftime('%d/%m/%Y')}).",
+                    )
+                # Validar cierre para mesas pasadas
+                if mesa.fecha < date.today() and mesa.planilla_cerrada_en is not None:
+                    return 403, ApiResponse(
+                        ok=False, message="No tiene permisos para modificar un acta de mesa pasada y cerrada."
+                    )
+            else:
+                # Validar tribunal para mesas en la fecha dada (solo presidente)
+                mesa_presidida = MesaExamen.objects.filter(
+                    materia_id=payload.materia_id,
+                    fecha=acta_fecha,
+                    docente_presidente=docente_obj,
+                ).first()
+                if not mesa_presidida:
+                    return 403, ApiResponse(
+                        ok=False,
+                        message="Solo el docente presidente de la mesa puede generar el acta. Los vocales tienen acceso de solo lectura.",
+                    )
+                if acta_fecha > date.today():
+                    return 403, ApiResponse(
+                        ok=False,
+                        message=f"No se pueden cargar calificaciones antes de la fecha fijada para la mesa ({acta_fecha.strftime('%d/%m/%Y')}).",
+                    )
+        except Docente.DoesNotExist:
+            return 403, ApiResponse(ok=False, message="No se encontró un perfil de docente asociado a su usuario.")
+
+    try:
+        materia = Materia.objects.select_related("plan_de_estudio").get(pk=payload.materia_id)
+    except Materia.DoesNotExist:
+        return 404, ApiResponse(ok=False, message="Materia no encontrada.")
+
+    plan = materia.plan_de_estudio
+    if plan.profesorado_id != profesorado.id:
+        return 400, ApiResponse(ok=False, message="Inconsistencia de Plan/Profesorado.")
+
+    # Validar duplicados por Libro/Folio/Materia/Fecha (Evitar carga doble de la misma planilla física)
+    if payload.libro and payload.folio:
+        duplicate = ActaExamen.objects.filter(
+            materia_id=payload.materia_id, fecha=acta_fecha, libro=payload.libro, folio=payload.folio
+        ).first()
+        if duplicate:
+            return 400, ApiResponse(
+                ok=False,
+                message=f"Ya existe un acta registrada ({duplicate.codigo}) para esta materia en la fecha {acta_fecha} con Libro {payload.libro} y Folio {payload.folio}.",
+            )
+
+    # Ciclo de validación y auto-creación de alumnos
+    user_dni = getattr(request.user, "username", "")
+    for estudiante_data in payload.estudiantes:
+        clean_dni = estudiante_data.dni.strip()
+        if not clean_dni:
+            continue
+        if clean_dni == user_dni:
+            return 403, ApiResponse(ok=False, message="No puede cargar un acta donde figura usted mismo.")
+
+        estudiante = Estudiante.objects.filter(persona__dni=clean_dni).first()
+        if not estudiante:
+            # Creación automática para legajos históricos
+            nombre_completo = estudiante_data.apellido_nombre.strip()
+            parts = nombre_completo.split(",")
+            if len(parts) == 2:
+                from django.contrib.auth.models import User
+
+                from core.models import Persona
+
+                last_name, first_name = parts[0].strip(), parts[1].strip()
+                user, _ = User.objects.get_or_create(
+                    username=clean_dni, defaults={"first_name": first_name, "last_name": last_name}
+                )
+                if _:
+                    user.set_password(secrets.token_urlsafe(12))
+                    user.save()
+                persona, _ = Persona.objects.update_or_create(
+                    dni=clean_dni, defaults={"nombre": first_name, "apellido": last_name}
+                )
+                estudiante = Estudiante.objects.create(
+                    user=user, persona=persona, estado_legajo=Estudiante.EstadoLegajo.PENDIENTE
+                )
+            else:
+                return 400, ApiResponse(ok=False, message=f"Falta 'Apellido, Nombre' para crear alumno {clean_dni}")
+
+        estudiante.asignar_profesorado(profesorado)
+
+    # Generación de códigos administrativos (Libro/Folio/Acta)
+    anio = acta_fecha.year
+    numero = _next_acta_numero(profesorado.id, anio)
+    codigo = _compute_acta_codigo(profesorado, anio, numero)
+
+    # Validación académica al momento de generar el acta
+    # (complementa la verificación al inscribirse — puede haber cambiado desde entonces)
+    from apps.estudiantes.api.mesas_api import _check_academic_eligibility
+
+    AUSENTES = {ActaExamenEstudiante.NOTA_AUSENTE_JUSTIFICADO, ActaExamenEstudiante.NOTA_AUSENTE_INJUSTIFICADO}
+
+    for est_item in payload.estudiantes:
+        clean_dni = est_item.dni.strip()
+        if not clean_dni:
+            continue
+        # Ausentes no se validan académicamente
+        if est_item.calificacion_definitiva in AUSENTES:
+            continue
+
+        # SI NO ES ESTRICTO (Primera Carga), saltamos validaciones académicas pesadas
+        if not payload.strict:
+            continue
+
+        est_obj = Estudiante.objects.filter(persona__dni=clean_dni).first()
+        if not est_obj:
+            continue  # Legajo histórico nuevo — se validará en otro momento
+        # Buscar la mesa asociada por materia y fecha
+        mesa = MesaExamen.objects.filter(materia=materia, fecha=acta_fecha).first()
+        if mesa:
+            eligible, motivo, _ = _check_academic_eligibility(
+                est_obj,
+                materia=mesa.materia,
+                modalidad=mesa.modalidad,
+                mesa=mesa,
+                bypass_legajo=True,
+                bypass_correlativas=not payload.strict,
+                bypass_regularidad=not payload.strict,
+                bypass_historial=not payload.strict,
+            )
+            if not eligible:
+                # Advertencia no bloqueante para inscripciones ya existentes;
+                # bloqueante si el estudiante no está inscripto (caso manual sin mesa)
+                insc = InscripcionMesa.objects.filter(
+                    estudiante=est_obj, mesa=mesa, estado=InscripcionMesa.Estado.INSCRIPTO
+                ).exists()
+                if not insc:
+                    return 400, ApiResponse(
+                        ok=False, message=f"El estudiante {clean_dni} no cumple los requisitos para rendir: {motivo}"
+                    )
+
+    # Clasificación de resultados para auditoría de totales
+    categoria_counts = {"aprobado": 0, "desaprobado": 0, "ausente": 0}
+    for est_item in payload.estudiantes:
+        if est_item.calificacion_definitiva not in ACTA_NOTA_CHOICES:
+            return 400, ApiResponse(ok=False, message=f"Nota inválida para {est_item.dni}")
+
+        # Salvaguarda: Evitar dobles aprobaciones en trayectoria (Omitir si no es estricto)
+        if payload.strict and _clasificar_resultado(est_item.calificacion_definitiva) == "aprobado":
+            est_obj = Estudiante.objects.filter(persona__dni=est_item.dni).first()
+            if est_obj and estudiante_tiene_materia_aprobada(est_obj, materia):
+                return 400, ApiResponse(
+                    ok=False, message=f"El estudiante {est_obj.dni} ya aprobó esta materia anteriormente."
+                )
+
+        categoria = _clasificar_resultado(est_item.calificacion_definitiva)
+        categoria_counts[categoria] += 1
+
+    error_acta_oral = _validar_examen_oral_tiene_acta(mesa, payload.estudiantes)
+    if error_acta_oral:
+        return 400, ApiResponse(ok=False, message=error_acta_oral)
+
+    usuario = getattr(request, "user", None)
+    with transaction.atomic():
+        # Libro y folio se asignan solos cuando no vienen en el payload: el acta
+        # digital se numera al guardarse definitivamente con las notas. Si el
+        # payload los trae (carga histórica de actas en papel), se respetan.
+        acta_libro = payload.libro or ""
+        acta_folio = payload.folio or ""
+        if not acta_libro and not acta_folio:
+            # El bloqueo (por profesorado, que es como se numera el folio ahora)
+            # evita que dos cierres simultáneos tomen el mismo folio.
+            ActaExamen.objects.select_for_update().filter(
+                libro=LIBRO_DIGITAL, profesorado_id=profesorado.id
+            ).values_list("id", flat=True).last()
+            acta_libro = LIBRO_DIGITAL
+            acta_folio = generar_folio_digital(profesorado.id)
+
+        # Solo las actas digitales llevan clave registral: es UNIQUE en la base y el
+        # histórico en papel tiene folios repetidos, así que allí queda en NULL
+        # (MySQL admite múltiples NULL en un índice único).
+        clave_registral = clave_registral_digital(profesorado.id, acta_folio) if acta_libro == LIBRO_DIGITAL else None
+
+        acta = ActaExamen.objects.create(
+            codigo=codigo,
+            numero=numero,
+            anio_academico=anio,
+            tipo=payload.tipo,
+            profesorado=profesorado,
+            materia=materia,
+            plan=plan,
+            anio_cursada=materia.anio_cursada,
+            fecha=acta_fecha,
+            folio=acta_folio,
+            libro=acta_libro,
+            clave_registral=clave_registral,
+            observaciones=payload.observaciones or "",
+            total_alumnos=len(payload.estudiantes),
+            total_aprobados=categoria_counts["aprobado"],
+            total_desaprobados=categoria_counts["desaprobado"],
+            total_ausentes=categoria_counts["ausente"],
+            created_by=usuario if getattr(usuario, "is_authenticated", False) else None,
+            mesa=mesa,
+        )
+
+        # Persistir tribunal docente
+        docente_presidente = None
+        for idx, docente_data in enumerate(payload.docentes):
+            rol = (
+                docente_data.rol
+                if docente_data.rol in dict(ActaExamenDocente.Rol.choices)
+                else ActaExamenDocente.Rol.PRESIDENTE
+            )
+            docente_obj = (
+                Docente.objects.filter(id=docente_data.docente_id).first() if docente_data.docente_id else None  # type: ignore
+            )
+            ActaExamenDocente.objects.create(
+                acta=acta,
+                docente=docente_obj,
+                nombre=docente_data.nombre.strip(),
+                dni=(docente_data.dni or "").strip(),
+                rol=rol,
+                orden=idx,
+            )
+            if rol == ActaExamenDocente.Rol.PRESIDENTE:
+                docente_presidente = docente_obj
+
+        # Sincronización de Mesa de Examen (Presidencia, Vocales)
+        if not mesa:
+            # Fallback para cargas que no indican la mesa. Si hay dos mesas de la
+            # misma materia el mismo día (dos turnos), esto elige una de las dos:
+            # el orden explícito evita al menos que la elección varíe entre
+            # ejecuciones, porque MesaExamen no define ordering y sin order_by el
+            # resultado de .first() queda a criterio del motor.
+            mesa = (
+                MesaExamen.objects.filter(
+                    materia=materia,
+                    fecha=acta_fecha,
+                    modalidad=MesaExamen.Modalidad.LIBRE
+                    if payload.tipo == ActaExamen.Tipo.LIBRE
+                    else MesaExamen.Modalidad.REGULAR,
+                )
+                .order_by("hora_desde", "id")
+                .first()
+            )
+            if not mesa:
+                mesa = MesaExamen.objects.create(
+                    materia=materia,
+                    fecha=acta_fecha,
+                    tipo=MesaExamen.Tipo.FINAL,
+                    modalidad=MesaExamen.Modalidad.LIBRE
+                    if payload.tipo == ActaExamen.Tipo.LIBRE
+                    else MesaExamen.Modalidad.REGULAR,
+                    codigo=f"MA-{acta.id}-{acta_fecha.strftime('%Y%m%d')}",  # type: ignore
+                    docente_presidente=docente_presidente,
+                    planilla_cerrada_en=timezone.now(),
+                    planilla_cerrada_por=usuario if getattr(usuario, "is_authenticated", False) else None,
+                )
+                acta.mesa = mesa
+                acta.save(update_fields=["mesa"])
+            elif not mesa.planilla_cerrada_en:
+                mesa.planilla_cerrada_en = timezone.now()
+                mesa.planilla_cerrada_por = usuario if getattr(usuario, "is_authenticated", False) else None
+                mesa.save(update_fields=["planilla_cerrada_en", "planilla_cerrada_por"])
+                acta.mesa = mesa
+                acta.save(update_fields=["mesa"])
+        else:
+            if not mesa.planilla_cerrada_en:
+                mesa.planilla_cerrada_en = timezone.now()
+                mesa.planilla_cerrada_por = usuario if getattr(usuario, "is_authenticated", False) else None
+                mesa.save(update_fields=["planilla_cerrada_en", "planilla_cerrada_por"])
+
+        # Carga de renglones de acta y actualización de inscripciones a mesa
+        for est_item in payload.estudiantes:
+            acta_est_obj = ActaExamenEstudiante.objects.create(
+                acta=acta,
+                numero_orden=est_item.numero_orden,
+                permiso_examen=est_item.permiso_examen or "",
+                dni=est_item.dni.strip(),
+                apellido_nombre=est_item.apellido_nombre.strip(),
+                examen_escrito=est_item.examen_escrito or "",
+                examen_oral=est_item.examen_oral or "",
+                calificacion_definitiva=est_item.calificacion_definitiva,
+                observaciones=est_item.observaciones or "",
+            )
+
+            est_obj = Estudiante.objects.filter(persona__dni=est_item.dni.strip()).first()
+            if est_obj:
+                # Mapeamos la calificación del acta a condiciones de InscripcionMesa
+                calif = est_item.calificacion_definitiva.strip().upper()
+                condicion = InscripcionMesa.Condicion.DESAPROBADO
+                nota_dec = None
+                if calif.isdigit():
+                    nota_dec = Decimal(calif)
+                    if nota_dec >= 6:
+                        condicion = InscripcionMesa.Condicion.APROBADO
+                elif calif == ActaExamenEstudiante.NOTA_AUSENTE_JUSTIFICADO:
+                    condicion = InscripcionMesa.Condicion.AUSENTE_JUSTIFICADO
+                elif calif == ActaExamenEstudiante.NOTA_AUSENTE_INJUSTIFICADO:
+                    condicion = InscripcionMesa.Condicion.AUSENTE
+
+                InscripcionMesa.objects.update_or_create(
+                    mesa=mesa,
+                    estudiante=est_obj,
+                    defaults={
+                        "estado": InscripcionMesa.Estado.INSCRIPTO,
+                        "fecha_resultado": acta_fecha,
+                        "condicion": condicion,
+                        "nota": nota_dec,
+                        # El folio realmente asignado, no el del payload: en la carga
+                        # digital viene vacío y lo genera el backend.
+                        "folio": acta_folio,
+                        "libro": acta_libro,
+                        "observaciones": "Carga por Acta de Examen",
+                        "cuenta_para_intentos": condicion != InscripcionMesa.Condicion.AUSENTE_JUSTIFICADO,
+                    },
+                )
+                verify_acta_consistency(acta_est_obj)
+
+        # Registrar acción en auditoría
+        log_action_from_request(
+            request,
+            accion="CREATE",
+            tipo_accion="CRUD",
+            detalle_accion=f"Creación de Acta de Examen: {codigo}",
+            entidad="ActaExamen",
+            entidad_id=acta.id,  # type: ignore
+            metadata={
+                "libro": acta_libro,
+                "folio": acta_folio,
+                "materia": materia.nombre,
+                "total_alumnos": len(payload.estudiantes),
+            },
+        )
+
+    # El acta quedó generada: el borrador provisorio de esta mesa (si
+    # existía) queda obsoleto. No se borra, se desactiva.
+    if payload.mesa_id:
+        from core.models import BorradorActaFinal
+
+        BorradorActaFinal.objects.filter(mesa_id=payload.mesa_id, activo=True).update(activo=False)
+
+    return ApiResponse(
+        ok=True,
+        message="Acta de examen generada correctamente.",
+        data=ActaCreateOutLocal(id=acta.id, codigo=acta.codigo).dict(),  # type: ignore
+    )
+
+
+@router.api_operation(
+    ["PUT", "POST"],
+    "/actas/{acta_id}",
+    response={200: ApiResponse, 400: ApiResponse, 404: ApiResponse, 403: ApiResponse},
+    auth=JWTAuth(),
+)
+def actualizar_acta_examen(request, acta_id: int, payload: ActaCreateLocal = Body(...)):
+    """
+    Actualiza o rectifica un acta de examen existente.
+    Bloquea la edición si la Mesa de Examen ya ha sido auditada y cerrada por bedelía fuera de este flujo.
+    """
+    from datetime import date
+
+    from core.permissions import can, get_user_roles, require
+
+    user_roles = get_user_roles(request.user)
+    is_docente_only = "docente" in user_roles and not can(request.user, "acta_manual")
+
+    if is_docente_only:
+        require(request.user, "carga_notas")
+    else:
+        require(request.user, "acta_manual")
+
+    acta = ActaExamen.objects.filter(id=acta_id).first()
+    if not acta:
+        return 404, ApiResponse(ok=False, message="Acta no encontrada.")
+
+    nueva_materia = Materia.objects.filter(id=payload.materia_id).first()
+    if not nueva_materia:
+        return 400, ApiResponse(ok=False, message="Materia no encontrada.")
+
+    nuevo_profesorado = Profesorado.objects.filter(id=payload.profesorado_id).first()
+    if not nuevo_profesorado:
+        return 400, ApiResponse(ok=False, message="Profesorado no encontrado.")
+
+    # Resolución de mesa
+    mesa = None
+    if payload.mesa_id:
+        mesa = MesaExamen.objects.filter(id=payload.mesa_id).first()
+    if not mesa and acta.mesa_id:  # type: ignore
+        mesa = acta.mesa
+
+    # Validar tribunal y fecha para docentes
+    if is_docente_only:
+        try:
+            docente_obj = Docente.objects.get(persona__user_profile__user=request.user)
+            if mesa:
+                if docente_obj.id != mesa.docente_presidente_id:
+                    return 403, ApiResponse(
+                        ok=False,
+                        message="Solo el docente presidente de la mesa puede modificar esta acta. Los vocales tienen acceso de solo lectura.",
+                    )
+                if mesa.fecha > date.today():
+                    return 403, ApiResponse(
+                        ok=False,
+                        message=f"No se pueden modificar calificaciones antes de la fecha fijada para la mesa ({mesa.fecha.strftime('%d/%m/%Y')}).",
+                    )
+                if mesa.fecha < date.today() and mesa.planilla_cerrada_en is not None:
+                    return 403, ApiResponse(
+                        ok=False, message="No tiene permisos para modificar un acta de mesa pasada y cerrada."
+                    )
+        except Docente.DoesNotExist:
+            return 403, ApiResponse(ok=False, message="No se encontró un perfil de docente asociado a su usuario.")
+
+    # Mesa vinculada a la materia/fecha ORIGINAL (antes de editar)
+    fecha_original = acta.fecha
+    tipo_original = acta.tipo
+    mesa_modalidad = MesaExamen.Modalidad.LIBRE if acta.tipo == ActaExamen.Tipo.LIBRE else MesaExamen.Modalidad.REGULAR
+    mesa_vieja = MesaExamen.objects.filter(
+        materia_id=acta.materia_id,
+        fecha=fecha_original,
+        modalidad=mesa_modalidad,  # type: ignore
+    ).first()
+
+    # Si cambió materia, fecha o tipo, buscar/crear la mesa correspondiente a los nuevos valores
+    nueva_fecha = payload.fecha
+    materia_cambio = acta.materia_id != payload.materia_id  # type: ignore
+    fecha_cambio = str(fecha_original) != str(nueva_fecha)
+    tipo_cambio = acta.tipo != payload.tipo
+
+    nueva_modalidad = (
+        MesaExamen.Modalidad.LIBRE if payload.tipo == ActaExamen.Tipo.LIBRE else MesaExamen.Modalidad.REGULAR
+    )
+
+    if materia_cambio or fecha_cambio or tipo_cambio:
+        mesa, created = MesaExamen.objects.get_or_create(
+            materia_id=payload.materia_id,
+            fecha=nueva_fecha,
+            modalidad=nueva_modalidad,
+            defaults={
+                "tipo": MesaExamen.Tipo.FINAL,
+                "codigo": f"MA-{acta.id}-{nueva_fecha}-R",  # type: ignore
+                "planilla_cerrada_en": timezone.now(),
+            },
+        )
+        if not created and not mesa.planilla_cerrada_en:
+            mesa.planilla_cerrada_en = timezone.now()
+            mesa.save(update_fields=["planilla_cerrada_en"])
+        # Limpiar InscripcionMesa de la mesa vieja vinculadas a este acta
+        if mesa_vieja:
+            InscripcionMesa.objects.filter(mesa=mesa_vieja, folio=acta.folio).delete()
+
+            # Limpieza de "mesa fantasma": si la mesa vieja queda sin inscriptos
+            # y era una mesa generada automáticamente (MA-), la eliminamos.
+            if (
+                mesa_vieja.codigo
+                and mesa_vieja.codigo.startswith("MA-")
+                and not mesa_vieja.inscripciones.exists()  # type: ignore
+                and not ActaExamen.objects.filter(
+                    materia=mesa_vieja.materia, fecha=mesa_vieja.fecha, tipo=tipo_original
+                )
+                .exclude(id=acta.id)  # type: ignore
+                .exists()
+            ):
+                mesa_vieja.delete()
+    else:
+        mesa = mesa_vieja
+
+    categoria_counts = {"aprobado": 0, "desaprobado": 0, "ausente": 0}
+    for est_item in payload.estudiantes:
+        categoria = _clasificar_resultado(est_item.calificacion_definitiva)
+        categoria_counts[categoria] += 1
+
+    error_acta_oral = _validar_examen_oral_tiene_acta(mesa, payload.estudiantes)
+    if error_acta_oral:
+        return 400, ApiResponse(ok=False, message=error_acta_oral)
+
+    usuario = getattr(request, "user", None)
+    # Capturar estado previo para auditoría
+    before = snapshot(acta)
+    with transaction.atomic():
+        acta.tipo = payload.tipo
+        acta.materia = nueva_materia
+        acta.profesorado = nuevo_profesorado
+        acta.fecha = payload.fecha
+        # El folio digital ya asignado no se pierde si el formulario no lo envía:
+        # es la identificación registral del acta y solo cambia si se indica otro.
+        if payload.folio or payload.libro:
+            acta.folio = payload.folio or ""
+            acta.libro = payload.libro or ""
+        elif acta.libro != LIBRO_DIGITAL:
+            acta.folio = ""
+            acta.libro = ""
+        # La clave registral acompaña a libro/folio para que el UNIQUE siga siendo
+        # cierto tras la edición; las actas en papel se mantienen en NULL.
+        acta.clave_registral = (
+            clave_registral_digital(acta.profesorado_id, acta.folio) if acta.libro == LIBRO_DIGITAL else None
+        )
+        acta.observaciones = payload.observaciones or ""
+        acta.total_alumnos = len(payload.estudiantes)
+        acta.total_aprobados = categoria_counts["aprobado"]
+        acta.total_desaprobados = categoria_counts["desaprobado"]
+        acta.total_ausentes = categoria_counts["ausente"]
+        acta.updated_by = usuario if getattr(usuario, "is_authenticated", False) else None
+        acta.mesa = mesa
+        acta.save()
+
+        if mesa and not mesa.planilla_cerrada_en:
+            mesa.planilla_cerrada_en = timezone.now()
+            mesa.planilla_cerrada_por = usuario if getattr(usuario, "is_authenticated", False) else None
+            mesa.save(update_fields=["planilla_cerrada_en", "planilla_cerrada_por"])
+
+        # Re-construcción del tribunal docente
+        acta.docentes.all().delete()  # type: ignore
+        pres_obj = voc1_obj = voc2_obj = None
+        for idx, docente_data in enumerate(payload.docentes):
+            rol = (
+                docente_data.rol
+                if docente_data.rol in dict(ActaExamenDocente.Rol.choices)
+                else ActaExamenDocente.Rol.PRESIDENTE
+            )
+            docente_obj = (
+                Docente.objects.filter(id=docente_data.docente_id).first() if docente_data.docente_id else None  # type: ignore
+            )
+            ActaExamenDocente.objects.create(
+                acta=acta,
+                docente=docente_obj,
+                nombre=docente_data.nombre.strip(),
+                dni=(docente_data.dni or "").strip(),
+                rol=rol,
+                orden=idx,
+            )
+            if rol == ActaExamenDocente.Rol.PRESIDENTE:
+                pres_obj = docente_obj
+            elif rol == ActaExamenDocente.Rol.VOCAL1:
+                voc1_obj = docente_obj
+            elif rol == ActaExamenDocente.Rol.VOCAL2:
+                voc2_obj = docente_obj
+
+        # Sincronizar mesa con el tribunal actualizado.
+        # OJO: el selector de tribunal del formulario no siempre manda un
+        # docente_id vinculado (a veces queda como texto libre nombre/dni
+        # sin resolver a un Docente real) — si eso pasa, pres_obj/voc1_obj/
+        # voc2_obj quedan en None, y pisar la mesa con eso BORRA quién es el
+        # presidente/vocal real (rompiendo, entre otras cosas, que el
+        # docente vea sus propias mesas al simular su usuario). Por eso solo
+        # se actualiza cada campo cuando SÍ se resolvió un docente real;
+        # si no, se deja lo que ya tenía la mesa.
+        if mesa:
+            update_fields = []
+            if pres_obj is not None:
+                mesa.docente_presidente = pres_obj
+                update_fields.append("docente_presidente")
+            if voc1_obj is not None:
+                mesa.docente_vocal1 = voc1_obj
+                update_fields.append("docente_vocal1")
+            if voc2_obj is not None:
+                mesa.docente_vocal2 = voc2_obj
+                update_fields.append("docente_vocal2")
+            if update_fields:
+                mesa.save(update_fields=update_fields)
+
+        # Re-construcción de nómina (Idempotencia)
+        acta.estudiantes.all().delete()  # type: ignore
+        if mesa:
+            # Antes esto borraba TODAS las InscripcionMesa de la mesa+folio y
+            # las recreaba de cero más abajo (con update_or_create) — pero
+            # como el borrado corría primero, el update_or_create nunca
+            # encontraba nada para actualizar y terminaba creando filas
+            # nuevas con ID distinto en cada edición del acta. Eso rompía
+            # cualquier dato atado a esa InscripcionMesa por FK con CASCADE
+            # (el acta oral ya cargada, o un borrador de "Guardar avance"),
+            # que se borraba en silencio sin que nadie lo pidiera.
+            # Ahora solo se borran las inscripciones que YA NO están en la
+            # nómina nueva (estudiantes sacados del acta) — las que siguen
+            # se preservan intactas (mismo ID) para que update_or_create las
+            # actualice en vez de recrearlas.
+            dnis_nueva_nomina = {est_item.dni.strip() for est_item in payload.estudiantes if est_item.dni}
+            (
+                InscripcionMesa.objects.filter(mesa=mesa, folio=payload.folio)
+                .exclude(estudiante__persona__dni__in=dnis_nueva_nomina)
+                .delete()
+            )
+
+        for est_item in payload.estudiantes:
+            acta_est_obj = ActaExamenEstudiante.objects.create(
+                acta=acta,
+                numero_orden=est_item.numero_orden,
+                permiso_examen=est_item.permiso_examen or "",
+                dni=est_item.dni.strip(),
+                apellido_nombre=est_item.apellido_nombre.strip(),
+                examen_escrito=est_item.examen_escrito or "",
+                examen_oral=est_item.examen_oral or "",
+                calificacion_definitiva=est_item.calificacion_definitiva,
+                observaciones=est_item.observaciones or "",
+            )
+
+            est_obj = Estudiante.objects.filter(persona__dni=est_item.dni.strip()).first()
+            if est_obj and mesa:
+                # Sincronización iterativa de resultados
+                calif = est_item.calificacion_definitiva.strip().upper()
+                condicion = InscripcionMesa.Condicion.DESAPROBADO
+                nota_dec = None
+                if calif.isdigit():
+                    nota_dec = Decimal(calif)
+                    if nota_dec >= 6:
+                        condicion = InscripcionMesa.Condicion.APROBADO
+                elif calif == ActaExamenEstudiante.NOTA_AUSENTE_JUSTIFICADO:
+                    condicion = InscripcionMesa.Condicion.AUSENTE_JUSTIFICADO
+                elif calif == ActaExamenEstudiante.NOTA_AUSENTE_INJUSTIFICADO:
+                    condicion = InscripcionMesa.Condicion.AUSENTE
+
+                InscripcionMesa.objects.update_or_create(
+                    mesa=mesa,
+                    estudiante=est_obj,
+                    defaults={
+                        "estado": InscripcionMesa.Estado.INSCRIPTO,
+                        "fecha_resultado": payload.fecha,
+                        "condicion": condicion,
+                        "nota": nota_dec,
+                        # Los del acta ya actualizada, que conserva el folio digital
+                        # cuando el formulario no lo envía.
+                        "folio": acta.folio,
+                        "libro": acta.libro,
+                        "observaciones": "Carga por Acta de Examen",
+                        "cuenta_para_intentos": condicion != InscripcionMesa.Condicion.AUSENTE_JUSTIFICADO,
+                    },
+                )
+                verify_acta_consistency(acta_est_obj)
+
+        # Registrar acción en auditoría
+        log_action_from_request(
+            request,
+            accion="UPDATE",
+            tipo_accion="CRUD",
+            detalle_accion=f"Rectificación de Acta de Examen: {acta.codigo}",
+            entidad="ActaExamen",
+            entidad_id=acta_id,
+            before=before,
+            after=acta,
+            metadata={"motivo": "Rectificación administrativa", "nuevos_estudiantes_count": len(payload.estudiantes)},
+        )
+
+    return ApiResponse(ok=True, message="Acta rectificada correctamente.")
+
+
+@router.put(
+    "/actas/{acta_id}/header",
+    response={200: ApiResponse, 400: ApiResponse, 404: ApiResponse, 403: ApiResponse},
+    auth=JWTAuth(),
+)
+@requires("editar_estructura")
+def actualizar_cabecera_acta(request, acta_id: int):
+    """Acceso rápido para editar Libro/Folio sin afectar la nómina."""
+    return ApiResponse(ok=False, message="Operación deshabilitada. Utilice la actualización completa del acta.")
+
+
+@router.patch(
+    "/actas/{acta_id}/docentes",
+    response={200: ApiResponse, 400: ApiResponse, 404: ApiResponse, 403: ApiResponse},
+    auth=JWTAuth(),
+)
+@requires("editar_estructura")
+def actualizar_docentes_acta(request, acta_id: int, payload: list[ActaDocenteLocal] = Body(...)):
+    """
+    Actualiza solo el tribunal docente de un acta, sin tocar notas ni estudiantes.
+    Funciona aunque la planilla esté cerrada — el cierre protege las notas, no el tribunal.
+    """
+    acta = ActaExamen.objects.filter(id=acta_id).first()
+    if not acta:
+        return 404, ApiResponse(ok=False, message="Acta no encontrada.")
+
+    user = request.user
+    if not can(user, "cargar_equivalencias_titulos"):
+        from core.models import StaffAsignacion
+
+        carreras_ids = StaffAsignacion.objects.filter(user=user).values_list("profesorado_id", flat=True)
+        if acta.profesorado_id not in carreras_ids:  # type: ignore
+            return 403, ApiResponse(ok=False, message="No tiene permiso para editar actas de este profesorado.")
+
+    with transaction.atomic():
+        acta.docentes.all().delete()  # type: ignore
+        pres_obj = voc1_obj = voc2_obj = None
+        for idx, docente_data in enumerate(payload):
+            rol = (
+                docente_data.rol
+                if docente_data.rol in dict(ActaExamenDocente.Rol.choices)
+                else ActaExamenDocente.Rol.PRESIDENTE
+            )
+            docente_obj = (
+                Docente.objects.filter(id=docente_data.docente_id).first() if docente_data.docente_id else None
+            )
+            ActaExamenDocente.objects.create(
+                acta=acta,
+                docente=docente_obj,
+                nombre=docente_data.nombre.strip(),
+                dni=(docente_data.dni or "").strip(),
+                rol=rol,
+                orden=idx,
+            )
+            if rol == ActaExamenDocente.Rol.PRESIDENTE:
+                pres_obj = docente_obj
+            elif rol == ActaExamenDocente.Rol.VOCAL1:
+                voc1_obj = docente_obj
+            elif rol == ActaExamenDocente.Rol.VOCAL2:
+                voc2_obj = docente_obj
+
+        # Sincronizar mesa vinculada.
+        # Mismo cuidado que en actualizar_acta_examen: solo se pisa el
+        # presidente/vocal de la mesa cuando el tribunal del acta sí resolvió
+        # un Docente real — si el selector mandó nombre libre sin
+        # docente_id, no se borra el tribunal que la mesa ya tenía asignado.
+        modalidad = MesaExamen.Modalidad.LIBRE if acta.tipo == ActaExamen.Tipo.LIBRE else MesaExamen.Modalidad.REGULAR
+        mesa = MesaExamen.objects.filter(materia_id=acta.materia_id, fecha=acta.fecha, modalidad=modalidad).first()  # type: ignore
+        if mesa:
+            update_fields = []
+            if pres_obj is not None:
+                mesa.docente_presidente = pres_obj
+                update_fields.append("docente_presidente")
+            if voc1_obj is not None:
+                mesa.docente_vocal1 = voc1_obj
+                update_fields.append("docente_vocal1")
+            if voc2_obj is not None:
+                mesa.docente_vocal2 = voc2_obj
+                update_fields.append("docente_vocal2")
+            if update_fields:
+                mesa.save(update_fields=update_fields)
+
+        log_action_from_request(
+            request,
+            accion="UPDATE",
+            tipo_accion="CRUD",
+            detalle_accion=f"Actualización de tribunal del acta: {acta.codigo}",
+            entidad="ActaExamen",
+            entidad_id=acta_id,
+        )
+
+    return ApiResponse(ok=True, message="Tribunal actualizado correctamente.")
+
+
+def _puede_descargar_acta(request, acta) -> bool:
+    """
+    El personal con 'ver_actas' descarga cualquier acta. El docente solo la de su
+    propia mesa: acaba de cargarla y necesita el PDF, pero no las actas ajenas.
+    """
+    from apps.estudiantes.api.helpers.user_utils import _user_can_manage_mesa_planilla
+
+    active_role = request.headers.get("X-Active-Role")
+    if can(request.user, "ver_actas", active_role):
+        return True
+    mesa = getattr(acta, "mesa", None)
+    return bool(mesa) and _user_can_manage_mesa_planilla(request, mesa)
+
+
+@router.get(
+    "/actas/{acta_id}/pdf",
+    auth=JWTAuth(),
+)
+@requires_any("ver_actas", "carga_finales")
+def descargar_acta_pdf(request, acta_id: int):
+    """Genera y descarga el PDF del acta principal (alumnos del profesorado)."""
+    acta = ActaExamen.objects.filter(id=acta_id).select_related("mesa").first()
+    if not acta:
+        return HttpResponse("Acta no encontrada", status=404)
+    if not _puede_descargar_acta(request, acta):
+        return HttpResponse("No está autorizado a descargar esta acta.", status=403)
+
+    pdf_bytes = generar_acta_examen_pdf(acta, es_comisionados=False)
+
+    response = HttpResponse(pdf_bytes, content_type="application/pdf")
+    filename = f"ACTA_{acta.codigo}.pdf"
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
+@router.get(
+    "/actas/{acta_id}/pdf-comisionados",
+    auth=JWTAuth(),
+)
+@requires_any("ver_actas", "carga_finales")
+def descargar_acta_comisionados_pdf(request, acta_id: int):
+    """Genera y descarga el PDF de alumnos comisionados de un acta."""
+    acta = ActaExamen.objects.filter(id=acta_id).select_related("mesa").first()
+    if not acta:
+        return HttpResponse("Acta no encontrada", status=404)
+    if not _puede_descargar_acta(request, acta):
+        return HttpResponse("No está autorizado a descargar esta acta.", status=403)
+
+    pdf_bytes = generar_acta_examen_pdf(acta, es_comisionados=True)
+
+    response = HttpResponse(pdf_bytes, content_type="application/pdf")
+    filename = f"ACTA_{acta.codigo}_COMISIONADOS.pdf"
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response

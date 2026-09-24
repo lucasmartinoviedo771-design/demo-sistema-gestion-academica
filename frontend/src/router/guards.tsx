@@ -1,0 +1,117 @@
+import Box from "@mui/material/Box";
+import CircularProgress from "@mui/material/CircularProgress";
+import { Navigate, useLocation } from "react-router-dom";
+
+import { useAuth } from "@/context/AuthContext";
+import { hasAllRoles, hasAnyRole, hasCapability } from "@/utils/roles";
+
+type ProtectedProps = {
+	children: JSX.Element;
+	roles?: string[]; // p.ej. ["bedel","secretaria","admin"]
+	capability?: string; // p.ej. "ver_estudiantes" (preferido sobre roles)
+	redirectTo?: string; // default: "/login"
+	forbiddenTo?: string; // default: "/403"
+	requireAll?: boolean; // default: false (OR). Si true => AND.
+};
+
+export function ProtectedRoute({
+	children,
+	roles,
+	capability,
+	redirectTo = "/login",
+	forbiddenTo = "/403",
+	requireAll = false,
+}: ProtectedProps) {
+	const { user, loading } = useAuth();
+	const loc = useLocation();
+
+	if (loading) {
+		return (
+			<Box
+				sx={{
+					display: "flex",
+					flexDirection: "column",
+					justifyContent: "center",
+					alignItems: "center",
+					height: "100vh",
+					gap: 2,
+				}}
+			>
+				<CircularProgress />
+				<div style={{ fontFamily: "sans-serif", color: "#666" }}>
+					Cargando sesión...
+				</div>
+			</Box>
+		);
+	}
+
+	// No autenticado → al login, preservando "from"
+	if (!user) return <Navigate to={redirectTo} replace state={{ from: loc }} />;
+
+	const mustChange = Boolean(user.must_change_password);
+	if (mustChange && loc.pathname !== "/cambiar-password") {
+		return <Navigate to="/cambiar-password" replace state={{ from: loc }} />;
+	}
+
+	const mustCompleteProfile = Boolean(user.must_complete_profile);
+	if (
+		!mustChange &&
+		mustCompleteProfile &&
+		loc.pathname !== "/estudiantes/completar-perfil"
+	) {
+		return (
+			<Navigate
+				to="/estudiantes/completar-perfil"
+				replace
+				state={{ from: loc }}
+			/>
+		);
+	}
+
+	// Sin requisitos de acceso → alcanza con estar logueado
+	if (!capability && (!roles || roles.length === 0)) return children;
+
+	let hasAccess = false;
+
+	// 1. Evaluar capability del backend (fuente de verdad)
+	if (capability && hasCapability(user, capability)) {
+		hasAccess = true;
+	}
+
+	// 2. Evaluar roles legacy / fallback (compatibilidad hacia atrás)
+	if (!hasAccess && roles && roles.length > 0) {
+		hasAccess = requireAll ? hasAllRoles(user, roles) : hasAnyRole(user, roles);
+	}
+
+	if (!hasAccess) {
+		return <Navigate to={forbiddenTo} replace state={{ from: loc }} />;
+	}
+
+	return children;
+}
+
+import { getDefaultHomeRoute } from "@/utils/roles";
+
+export function PublicOnlyRoute({ children }: { children: JSX.Element }) {
+	const { user, loading } = useAuth();
+	const loc = useLocation();
+	if (loading) {
+		return children;
+	}
+	// Una sesión con cambio de contraseña obligatorio pendiente no debe
+	// bloquear /login: si no, alguien con una cuenta "trabada" en
+	// /cambiar-password no tenía forma de llegar al formulario de login
+	// para entrar con otra cuenta (quedaba redirigido en bucle a
+	// /cambiar-password sin poder salir). El botón de "cerrar sesión" en
+	// esa pantalla ya limpia el usuario antes de navegar, pero esto cubre
+	// también a quien llega a /login directo por URL con esa sesión viva.
+	if (user?.must_change_password) {
+		return children;
+	}
+	const redirectTo = getDefaultHomeRoute(user);
+	// Evita bucle/blank cuando el destino calculado es la misma ruta (ej: /login)
+	if (!user || redirectTo === loc.pathname) {
+		return children;
+	}
+	return <Navigate to={redirectTo} replace />;
+}

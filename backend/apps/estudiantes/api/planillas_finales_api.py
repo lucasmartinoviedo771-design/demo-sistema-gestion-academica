@@ -1,0 +1,574 @@
+from __future__ import annotations
+
+import os
+import re
+from datetime import date, datetime
+
+from django.conf import settings
+from django.http import HttpResponse
+from django.template.loader import render_to_string
+from django.utils import timezone
+from weasyprint import HTML
+
+from apps.common.api_schemas import ApiResponse
+from apps.common.date_utils import format_date, format_datetime
+from core.auth_ninja import JWTAuth
+from core.models import InscripcionMesa, MesaActaOral, MesaExamen
+
+from ..schemas import (
+    ConstanciaExamenItem,
+    MesaPlanillaCierreIn,
+    MesaPlanillaOut,
+    MesaPlanillaUpdateIn,
+)
+from .actas_orales import PLAZO_CONFORMIDAD, vencer_actas_orales_expiradas
+from .helpers import (
+    _docente_full_name,
+    _format_user_display,
+    _resolve_estudiante,
+    _user_can_manage_mesa_planilla,
+    _user_can_override_planilla_lock,
+    _user_can_view_mesa_planilla,
+)
+from .router import estudiantes_router
+
+
+def _mesa_planilla_condiciones() -> list[dict]:
+    return [
+        {
+            "value": InscripcionMesa.Condicion.APROBADO,
+            "label": "Aprobado",
+            "cuenta_para_intentos": True,
+        },
+        {
+            "value": InscripcionMesa.Condicion.DESAPROBADO,
+            "label": "Desaprobado",
+            "cuenta_para_intentos": True,
+        },
+        {
+            "value": InscripcionMesa.Condicion.AUSENTE,
+            "label": "Ausente",
+            "cuenta_para_intentos": False,
+        },
+        {
+            "value": InscripcionMesa.Condicion.AUSENTE_JUSTIFICADO,
+            "label": "Ausente justificado",
+            "cuenta_para_intentos": False,
+        },
+    ]
+
+
+@estudiantes_router.get(
+    "/mesas/{mesa_id}/planilla",
+    response={200: MesaPlanillaOut, 403: ApiResponse, 404: ApiResponse},
+    auth=JWTAuth(),
+)
+def obtener_mesa_planilla(request, mesa_id: int):
+    # Barrido automático antes de consultar (Removido por R2)
+    # MesaExamen.auto_cleanup_deserted_mesas()
+    mesa = (
+        MesaExamen.objects.select_related(
+            "materia__plan_de_estudio__profesorado",
+            "docente_presidente",
+            "docente_vocal1",
+            "docente_vocal2",
+        )
+        .filter(id=mesa_id)
+        .first()
+    )
+    if not mesa:
+        return 404, ApiResponse(ok=False, message="Mesa no encontrada.")
+    # Lectura: cualquier integrante del tribunal (presidente o vocal) y el
+    # personal autorizado. La edición se controla aparte, en los endpoints POST.
+    if not _user_can_view_mesa_planilla(request, mesa):
+        return 403, ApiResponse(
+            ok=False,
+            message="Solo los docentes del tribunal o el personal autorizado pueden acceder a esta planilla.",
+        )
+
+    inscripciones = (
+        InscripcionMesa.objects.filter(mesa_id=mesa_id)
+        .select_related("estudiante__persona")
+        .order_by("estudiante__persona__apellido", "estudiante__persona__nombre", "estudiante__persona__dni")
+    )
+    estudiantes = []
+    for insc in inscripciones:
+        estudiante = insc.estudiante
+        apellido = (estudiante.apellido or "").strip().upper()
+        nombre_p = (estudiante.nombre or "").strip()
+        if apellido and nombre_p:
+            nombre = f"{apellido}, {nombre_p}"
+        elif apellido:
+            nombre = apellido
+        else:
+            nombre = estudiante.dni
+        estudiantes.append(
+            {
+                "inscripcion_id": insc.id,
+                "estudiante_id": estudiante.id,
+                "dni": estudiante.dni,
+                "apellido_nombre": nombre,
+                "condicion": insc.condicion,
+                "condicion_display": insc.get_condicion_display() if insc.condicion else None,
+                "nota": float(insc.nota) if insc.nota is not None else None,
+                "folio": insc.folio,
+                "libro": insc.libro,
+                "fecha_resultado": (insc.fecha_resultado or mesa.fecha).isoformat()
+                if (insc.fecha_resultado or mesa.fecha)
+                else None,
+                "cuenta_para_intentos": insc.cuenta_para_intentos,
+                "observaciones": insc.observaciones,
+            }
+        )
+
+    materia = mesa.materia
+    plan = materia.plan_de_estudio if materia else None
+    profesorado = plan.profesorado if plan else None
+    hora_desde = mesa.hora_desde.strftime("%H:%M") if mesa.hora_desde else None
+    hora_hasta = mesa.hora_hasta.strftime("%H:%M") if mesa.hora_hasta else None
+
+    esta_cerrada = bool(mesa.planilla_cerrada_en)
+    can_override = _user_can_override_planilla_lock(request.user)
+    # Editar exige: no cerrada (o poder forzar), poder gestionar (presidente /
+    # staff, no vocales) y que la fecha de la mesa ya haya llegado.
+    puede_editar = (
+        ((not esta_cerrada) or can_override)
+        and _user_can_manage_mesa_planilla(request, mesa)
+        and mesa.fecha <= date.today()
+    )
+
+    return MesaPlanillaOut(
+        mesa_id=mesa.id,
+        materia_id=mesa.materia_id,
+        materia_nombre=materia.nombre if materia else "Materia",
+        materia_anio=materia.anio_cursada if materia else None,
+        regimen=materia.regimen if materia else None,
+        profesorado_id=profesorado.id if profesorado else None,
+        profesorado_nombre=profesorado.nombre if profesorado else None,
+        plan_id=plan.id if plan else None,
+        plan_resolucion=plan.resolucion if plan else None,
+        tipo=mesa.tipo,
+        modalidad=mesa.modalidad,
+        fecha=format_date(mesa.fecha),
+        fecha_iso=mesa.fecha.isoformat() if mesa.fecha else None,
+        hora_desde=hora_desde,
+        hora_hasta=hora_hasta,
+        mesa_codigo=mesa.codigo,
+        numero_mesa=mesa.numero_mesa,
+        aula=mesa.aula,
+        cupo=mesa.cupo,
+        tribunal_presidente=_docente_full_name(mesa.docente_presidente),
+        tribunal_vocal1=_docente_full_name(mesa.docente_vocal1),
+        tribunal_vocal2=_docente_full_name(mesa.docente_vocal2),
+        condiciones=_mesa_planilla_condiciones(),
+        estudiantes=estudiantes,
+        esta_cerrada=esta_cerrada,
+        cerrada_en=mesa.planilla_cerrada_en.isoformat() if mesa.planilla_cerrada_en else None,
+        cerrada_por=_format_user_display(mesa.planilla_cerrada_por),
+        puede_editar=puede_editar,
+        puede_cerrar=not esta_cerrada,
+        puede_reabrir=esta_cerrada and can_override,
+        acta_id=mesa.actas_cargadas.values_list("id", flat=True).first(),
+    )
+
+
+@estudiantes_router.post(
+    "/mesas/{mesa_id}/planilla",
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+    auth=JWTAuth(),
+)
+def actualizar_mesa_planilla(request, mesa_id: int, payload: MesaPlanillaUpdateIn):
+    mesa = MesaExamen.objects.filter(id=mesa_id).first()
+    if not mesa:
+        return 404, ApiResponse(ok=False, message="Mesa no encontrada.")
+    if not _user_can_manage_mesa_planilla(request, mesa):
+        return 403, ApiResponse(
+            ok=False,
+            message="Solo los docentes del tribunal o el personal autorizado pueden modificar esta planilla.",
+        )
+    if mesa.planilla_cerrada_en and not _user_can_override_planilla_lock(request.user):
+        return 400, ApiResponse(ok=False, message="La planilla ya está cerrada y no se puede editar.")
+
+    resultados = payload.estudiantes or []
+    update_fields = [
+        "condicion",
+        "nota",
+        "folio",
+        "libro",
+        "fecha_resultado",
+        "cuenta_para_intentos",
+        "observaciones",
+        "updated_at",
+    ]
+    updated = 0
+    user_dni = getattr(request.user, "username", "")
+    for item in resultados:
+        insc = (
+            InscripcionMesa.objects.filter(id=item.inscripcion_id, mesa_id=mesa_id)
+            .select_related("estudiante__user")
+            .first()
+        )
+        if not insc:
+            continue
+
+        if insc.estudiante.dni == user_dni:
+            return 403, ApiResponse(ok=False, message="No tienes permitido cargar o modificar tus propias notas.")
+
+        if item.condicion:
+            insc.condicion = item.condicion
+        if item.nota is not None:
+            insc.nota = item.nota
+        if item.folio is not None:
+            insc.folio = item.folio
+        if item.libro is not None:
+            insc.libro = item.libro
+        if item.fecha_resultado:
+            insc.fecha_resultado = item.fecha_resultado
+        if item.cuenta_para_intentos is not None:
+            insc.cuenta_para_intentos = item.cuenta_para_intentos
+        if item.observaciones is not None:
+            insc.observaciones = item.observaciones
+        insc.save(update_fields=update_fields)
+        updated += 1
+
+    # mesa.planilla_actualizada_en = timezone.now()
+    # mesa.save(update_fields=["planilla_actualizada_en", "planilla_actualizada_por"])
+
+    return ApiResponse(ok=True, message=f"{updated} registros actualizados.")
+
+
+@estudiantes_router.post(
+    "/mesas/{mesa_id}/cierre",
+    response={200: ApiResponse, 400: ApiResponse, 403: ApiResponse, 404: ApiResponse},
+    auth=JWTAuth(),
+)
+def gestionar_mesa_planilla_cierre(request, mesa_id: int, payload: MesaPlanillaCierreIn):
+    mesa = (
+        MesaExamen.objects.select_related("materia__plan_de_estudio__profesorado", "planilla_cerrada_por")
+        .filter(id=mesa_id)
+        .first()
+    )
+    if not mesa:
+        return 404, ApiResponse(ok=False, message="Mesa no encontrada.")
+    if not _user_can_manage_mesa_planilla(request, mesa):
+        return 403, ApiResponse(ok=False, message="No está autorizado para cerrar esta planilla.")
+
+    accion = payload.accion
+    if accion == "cerrar":
+        if mesa.planilla_cerrada_en:
+            return 400, ApiResponse(ok=False, message="La planilla ya está cerrada.")
+
+        # Cada estudiante tiene su propio plazo de 10 minutos para prestar
+        # conformidad, contado desde que se guardó SU acta. La planilla no puede
+        # cerrarse mientras alguno siga en plazo sin haber respondido.
+        #
+        # Antes se vencen las que ya expiraron: el cierre por timeout es lazy, y
+        # sin esto un estudiante que nunca abre la aplicación dejaría la planilla
+        # trabada para siempre.
+        actas_de_la_mesa = MesaActaOral.objects.filter(
+            mesa=mesa, estado_conformidad=MesaActaOral.EstadoConformidad.PENDIENTE
+        )
+        vencer_actas_orales_expiradas(actas_de_la_mesa)
+
+        en_plazo = list(
+            MesaActaOral.objects.filter(
+                mesa=mesa, estado_conformidad=MesaActaOral.EstadoConformidad.PENDIENTE
+            ).select_related("inscripcion__estudiante__persona")
+        )
+        if en_plazo:
+            ahora = timezone.now()
+            detalles = []
+            for acta in en_plazo:
+                persona = getattr(getattr(acta.inscripcion, "estudiante", None), "persona", None)
+                nombre = f"{persona.apellido}, {persona.nombre}" if persona else f"acta {acta.id}"
+                restantes = int((acta.notificado_en + PLAZO_CONFORMIDAD - ahora).total_seconds())
+                minutos = max(1, -(-restantes // 60))  # redondeo hacia arriba
+                detalles.append(f"{nombre} ({minutos} min)")
+            return 400, ApiResponse(
+                ok=False,
+                message=(
+                    "No se puede cerrar la planilla: hay actas orales esperando la conformidad "
+                    f"del estudiante. Falta que respondan o que venza su plazo: {'; '.join(detalles)}."
+                ),
+            )
+
+        # El acta oral (MesaActaOral) y la nota/condición oficial de la
+        # inscripción son dos registros separados: hasta acá, arriba, solo se
+        # exigía que el acta oral estuviera resuelta (no PENDIENTE) para poder
+        # cerrar, pero nada copiaba ese resultado hacia InscripcionMesa —
+        # quedaba la nota oficial en blanco pese a que el acta oral ya tenía
+        # todo cargado y confirmado. Antes de cerrar, se traslada automática-
+        # mente a los estudiantes que tengan acta oral resuelta con nota y
+        # todavía no tengan condición cargada a mano (no pisa una condición
+        # ya puesta manualmente por el docente/staff).
+        actas_resueltas = (
+            MesaActaOral.objects.filter(mesa=mesa)
+            .exclude(estado_conformidad=MesaActaOral.EstadoConformidad.PENDIENTE)
+            .exclude(nota_final="")
+            .select_related("inscripcion")
+        )
+        for acta in actas_resueltas:
+            insc = acta.inscripcion
+            if insc.condicion:
+                continue
+            match = re.match(r"\s*(\d+)", acta.nota_final)
+            if not match:
+                continue
+            nota_num = int(match.group(1))
+            if nota_num < 1 or nota_num > 10:
+                continue
+            insc.condicion = (
+                InscripcionMesa.Condicion.APROBADO if nota_num >= 6 else InscripcionMesa.Condicion.DESAPROBADO
+            )
+            insc.nota = nota_num
+            insc.fecha_resultado = mesa.fecha
+            insc.save(update_fields=["condicion", "nota", "fecha_resultado", "updated_at"])
+
+        mesa.planilla_cerrada_en = timezone.now()
+        mesa.planilla_cerrada_por = request.user if request.user.is_authenticated else None
+        mesa.save(update_fields=["planilla_cerrada_en", "planilla_cerrada_por"])
+        return ApiResponse(ok=True, message="Planilla cerrada.")
+
+    if accion == "reabrir":
+        if not _user_can_override_planilla_lock(request.user):
+            return 403, ApiResponse(ok=False, message="Solo Secretaría/Admin pueden reabrir planillas.")
+        mesa.planilla_cerrada_en = None
+        mesa.planilla_cerrada_por = None
+        mesa.save(update_fields=["planilla_cerrada_en", "planilla_cerrada_por"])
+        return ApiResponse(ok=True, message="Planilla reabierta.")
+
+    return 400, ApiResponse(ok=False, message="Acción de cierre no reconocida.")
+
+
+@estudiantes_router.get(
+    "/constancias-examen",
+    response={200: list[ConstanciaExamenItem], 404: ApiResponse},
+    auth=JWTAuth(),
+)
+def listar_constancias_examen(request, dni: str | None = None):
+    est = _resolve_estudiante(request, dni)
+    if not est:
+        return 404, ApiResponse(ok=False, message="No se encontró el estudiante.")
+
+    inscripciones = InscripcionMesa.objects.select_related(
+        "mesa__materia__plan_de_estudio__profesorado",
+        "mesa",
+        "mesa__materia",
+    ).filter(estudiante=est, estado=InscripcionMesa.Estado.INSCRIPTO)
+
+    # Si es un estudiante (y no staff), restringir a mesas de ventanas recientes
+    from django.utils import timezone
+
+    from core.models import VentanaHabilitacion
+    from core.permissions import can
+
+    es_staff = can(request.user, "editar_estudiantes")
+    if not es_staff:
+        today = timezone.now().date()
+        exam_windows = VentanaHabilitacion.objects.filter(
+            tipo__in=[
+                VentanaHabilitacion.Tipo.MESAS_FINALES,
+                VentanaHabilitacion.Tipo.MESAS_EXTRA,
+                VentanaHabilitacion.Tipo.INSCRIPCION,
+            ]
+        ).order_by("-hasta")
+
+        latest_window = exam_windows.first()
+        if latest_window:
+            # Permitimos la última ventana (haya cerrado o no) y cualquier otra activa actualmente
+            active_ids = list(
+                exam_windows.filter(activo=True, desde__lte=today, hasta__gte=today).values_list("id", flat=True)
+            )
+            relevant_ids = set(active_ids + [latest_window.id])
+            inscripciones = inscripciones.filter(mesa__ventana_id__in=relevant_ids)
+
+    inscripciones = inscripciones.order_by("-mesa__fecha")
+
+    items: list[ConstanciaExamenItem] = []
+    for insc in inscripciones:
+        if not insc.condicion:
+            continue
+        if insc.condicion in (
+            InscripcionMesa.Condicion.AUSENTE,
+            InscripcionMesa.Condicion.AUSENTE_JUSTIFICADO,
+        ):
+            continue
+        if not insc.fecha_resultado:
+            continue
+        mesa = insc.mesa
+        if not mesa:
+            continue
+        materia = mesa.materia
+        plan = materia.plan_de_estudio if materia else None
+        profesorado = plan.profesorado if plan else None
+        materia_anio = getattr(materia, "anio_cursada", None) if materia else None
+
+        presidente = (
+            f"{mesa.docente_presidente.apellido}, {mesa.docente_presidente.nombre}" if mesa.docente_presidente else None
+        )
+        vocal1 = f"{mesa.docente_vocal1.apellido}, {mesa.docente_vocal1.nombre}" if mesa.docente_vocal1 else None
+        vocal2 = f"{mesa.docente_vocal2.apellido}, {mesa.docente_vocal2.nombre}" if mesa.docente_vocal2 else None
+
+        items.append(
+            ConstanciaExamenItem(
+                inscripcion_id=insc.id,
+                estudiante=f"{est.apellido}, {est.nombre}".strip(", ") or est.dni,
+                dni=est.dni,
+                materia=materia.nombre if materia else "Materia",
+                materia_anio=materia_anio,
+                profesorado=profesorado.nombre if profesorado else None,
+                profesorado_id=profesorado.id if profesorado else None,
+                plan_resolucion=plan.resolucion if plan else None,
+                mesa_codigo=mesa.codigo,
+                mesa_fecha=format_date(mesa.fecha),
+                mesa_hora_desde=str(mesa.hora_desde)[:5] if mesa.hora_desde else None,
+                mesa_hora_hasta=_calc_hora_hasta(insc, mesa),
+                mesa_tipo=mesa.get_tipo_display(),
+                mesa_modalidad=mesa.get_modalidad_display(),
+                condicion=insc.condicion,
+                condicion_display=insc.get_condicion_display() or "",
+                nota=str(insc.nota) if insc.nota is not None else None,
+                folio=insc.folio or None,
+                libro=insc.libro or None,
+                tribunal_presidente=presidente,
+                tribunal_vocal1=vocal1,
+                tribunal_vocal2=vocal2,
+            )
+        )
+
+    return items
+
+
+MESES_ES = [
+    "enero",
+    "febrero",
+    "marzo",
+    "abril",
+    "mayo",
+    "junio",
+    "julio",
+    "agosto",
+    "septiembre",
+    "octubre",
+    "noviembre",
+    "diciembre",
+]
+
+
+@estudiantes_router.get(
+    "/constancias-examen/{inscripcion_id}/pdf",
+    auth=JWTAuth(),
+)
+def descargar_constancia_examen_pdf(
+    request, inscripcion_id: int, destinatario: str = "A quien corresponda", dni: str | None = None
+):
+    """Genera el PDF de la constancia de examen usando WeasyPrint."""
+    est = _resolve_estudiante(request, dni)
+    if not est:
+        return HttpResponse(status=404)
+
+    insc = (
+        InscripcionMesa.objects.select_related(
+            "mesa__materia__plan_de_estudio__profesorado",
+            "mesa__docente_presidente",
+            "mesa__docente_vocal1",
+            "mesa__docente_vocal2",
+            "estudiante",
+        )
+        .filter(id=inscripcion_id, estudiante=est)
+        .first()
+    )
+    if not insc:
+        return HttpResponse(status=404)
+
+    # No se puede generar constancia si el estudiante estuvo ausente o no tiene nota
+    AUSENTES = (InscripcionMesa.Condicion.AUSENTE, InscripcionMesa.Condicion.AUSENTE_JUSTIFICADO)
+    if not insc.condicion or insc.condicion in AUSENTES or insc.nota is None:
+        return HttpResponse(
+            b'{"detail": "No se puede generar constancia: el estudiante estuvo ausente o no tiene nota registrada."}',
+            status=422,
+            content_type="application/json",
+        )
+
+    mesa = insc.mesa
+    materia = mesa.materia if mesa else None
+    plan = materia.plan_de_estudio if materia else None
+    profesorado = plan.profesorado if plan else None
+
+    hoy = datetime.now()
+
+    logo_left_path = os.path.join(settings.BASE_DIR, "static/logos/escudo_ministerio_tdf.png")
+    logo_right_path = os.path.join(settings.BASE_DIR, "static/logos/logo_ipes.jpg")
+    if not os.path.exists(logo_left_path):
+        logo_left_path = os.path.join(settings.BASE_DIR, "backend/static/logos/escudo_ministerio_tdf.png")
+        logo_right_path = os.path.join(settings.BASE_DIR, "backend/static/logos/logo_ipes.jpg")
+
+    context = {
+        "estudiante": f"{est.apellido}, {est.nombre}".strip(", ") or est.dni,
+        "dni": est.dni,
+        "materia": materia.nombre if materia else "Materia",
+        "materia_anio": materia.anio_cursada if materia else None,
+        "profesorado": profesorado.nombre if profesorado else None,
+        "plan_resolucion": plan.resolucion if plan else None,
+        "mesa_codigo": mesa.codigo if mesa else None,
+        "mesa_fecha": format_date(mesa.fecha) if mesa else "",
+        "mesa_hora_desde": str(mesa.hora_desde)[:5] if mesa and mesa.hora_desde else None,
+        "mesa_hora_hasta": _calc_hora_hasta(insc, mesa) if mesa else None,
+        "mesa_modalidad": mesa.get_modalidad_display() if mesa else "",
+        "condicion_display": insc.get_condicion_display() or "",
+        "nota": str(insc.nota) if insc.nota is not None else None,
+        "tribunal_presidente": f"{mesa.docente_presidente.apellido}, {mesa.docente_presidente.nombre}"
+        if mesa and mesa.docente_presidente
+        else None,
+        "tribunal_vocal1": f"{mesa.docente_vocal1.apellido}, {mesa.docente_vocal1.nombre}"
+        if mesa and mesa.docente_vocal1
+        else None,
+        "tribunal_vocal2": f"{mesa.docente_vocal2.apellido}, {mesa.docente_vocal2.nombre}"
+        if mesa and mesa.docente_vocal2
+        else None,
+        "destinatario": destinatario or "A quien corresponda",
+        "hoy_dia": hoy.day,
+        "hoy_mes": MESES_ES[hoy.month - 1],
+        "hoy_anio": hoy.year,
+        "logo_left_path": logo_left_path,
+        "logo_right_path": logo_right_path,
+    }
+
+    html = render_to_string("core/constancia_examen_pdf.html", context)
+    pdf_content = HTML(string=html, base_url=request.build_absolute_uri("/")).write_pdf()
+
+    nombre_archivo = f"constancia_examen_{est.dni}.pdf"
+    response = HttpResponse(pdf_content, content_type="application/pdf")
+    response["Content-Disposition"] = f'inline; filename="{nombre_archivo}"'
+    return response
+
+
+def _calc_hora_hasta(insc, mesa) -> str | None:
+    from datetime import date, datetime, timedelta
+
+    # 1. Si la mesa estÃ¡ cerrada, usar esa hora
+    if mesa.planilla_cerrada_en:
+        return mesa.planilla_cerrada_en.strftime("%H:%M")
+
+    # 2. Si es primera carga (proxy: sin ventana o sin acta digital cerrada)
+    # y tiene hora_desde pero no hora_hasta definida
+    if not mesa.ventana_id and not mesa.hora_hasta:
+        if mesa.hora_desde:
+            try:
+                # Sumar 4 horas
+                dt = datetime.combine(date.today(), mesa.hora_desde) + timedelta(hours=4)
+                return dt.strftime("%H:%M")
+            except Exception:
+                pass
+
+    # 3. Si hay una hora_hasta explÃ­cita en la mesa, usarla
+    if mesa.hora_hasta:
+        return str(mesa.hora_hasta)[:5]
+
+    # 4. Fallback: hora de carga de la nota (usamos updated_at)
+    if insc.updated_at:
+        # Solo si es distinta a la de creacion o si consideramos que ya tiene nota
+        if insc.condicion:
+            return insc.updated_at.strftime("%H:%M")
+
+    return None

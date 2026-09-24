@@ -1,0 +1,440 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+from itertools import chain
+
+from django.contrib.auth.models import User
+from django.db import transaction
+
+from apps.estudiantes.services.cursada import estudiante_tiene_materia_aprobada
+from apps.primera_carga.audit_utils import verify_equivalencia_consistency
+from core.models import (
+    ActaExamen,
+    ActaExamenEstudiante,
+    Correlatividad,
+    CorrelatividadVersion,
+    EquivalenciaDisposicion,
+    EquivalenciaDisposicionDetalle,
+    Estudiante,
+    InscripcionMesa,
+    Materia,
+    PlanDeEstudio,
+    Profesorado,
+    Regularidad,
+)
+
+
+@dataclass
+class EquivalenciaDisposicionResult:
+    disposicion: EquivalenciaDisposicion
+    detalles: list[EquivalenciaDisposicionDetalle]
+
+
+def _correlatividades_qs(materia: Materia, tipo: str, estudiante: Estudiante | None = None):
+    qs = Correlatividad.objects.filter(materia_origen=materia, tipo=tipo)
+    if not estudiante or not materia.plan_de_estudio_id:
+        return qs
+    profesorado_id = getattr(materia.plan_de_estudio, "profesorado_id", None)
+    if not profesorado_id:
+        return qs
+    cohorte = estudiante.obtener_anio_ingreso(profesorado_id)
+    version = CorrelatividadVersion.vigente_para(
+        plan_id=materia.plan_de_estudio_id,
+        profesorado_id=profesorado_id,
+        cohorte=cohorte,
+    )
+    if version:
+        return qs.filter(versiones__version=version)
+    return qs
+
+
+def _es_nota_aprobada(nota: str) -> bool:
+    if not nota:
+        return False
+    n = nota.strip().upper()
+    # Explicit failing codes
+    if n in ("AUS", "DES", "REP", "LAT", "LBI", "LIB", "INC"):
+        return False
+
+    # Try numeric grade
+    try:
+        val = float(n.replace(",", "."))
+        return val >= 6.0
+    except ValueError:
+        pass
+
+    # Check for passing codes (APR=Aprobado, PROM=Promocionado, EQUIV=Equivalencia)
+    if any(code in n for code in ("APR", "PROM", "EQ", "EXIM")):
+        return True
+
+    return False
+
+
+def _materias_aprobadas_ids(estudiante: Estudiante, plan: PlanDeEstudio) -> set[int]:
+    # 1. Actas de Examen: Filter by passing grade
+    raw_actas = ActaExamenEstudiante.objects.filter(
+        dni=estudiante.dni,
+        acta__materia__plan_de_estudio=plan,
+    ).values_list("acta__materia_id", "calificacion_definitiva")
+
+    actas_ids = set()
+    for mid, nota in raw_actas:
+        if _es_nota_aprobada(nota):
+            actas_ids.add(mid)
+
+    # 2. Mesas de Examen (InscripcionMesa)
+    mesas_ids = set(
+        InscripcionMesa.objects.filter(
+            estudiante=estudiante,
+            mesa__materia__plan_de_estudio=plan,
+            condicion=InscripcionMesa.Condicion.APROBADO,
+        ).values_list("mesa__materia_id", flat=True)
+    )
+
+    # 3. Regularidades (Situacion de Aprobación/Promoción)
+    reg_ids = set(
+        Regularidad.objects.filter(
+            estudiante=estudiante,
+            materia__plan_de_estudio=plan,
+            situacion__in=(
+                Regularidad.Situacion.PROMOCIONADO,
+                Regularidad.Situacion.APROBADO,
+            ),
+        ).values_list("materia_id", flat=True)
+    )
+    return set(chain(actas_ids, mesas_ids, reg_ids))
+
+
+def materias_pendientes_para_equivalencia(estudiante: Estudiante, plan: PlanDeEstudio):
+    aprobadas = _materias_aprobadas_ids(estudiante, plan)
+    materias = Materia.objects.filter(plan_de_estudio=plan).order_by("anio_cursada", "nombre")
+    return materias.exclude(id__in=aprobadas)
+
+
+def _verificar_correlatividades_final(estudiante: Estudiante, materia: Materia) -> list[str]:
+    faltantes: list[str] = []
+    req_ids = list(
+        _correlatividades_qs(
+            materia,
+            Correlatividad.TipoCorrelatividad.APROBADA_PARA_RENDIR,
+            estudiante,
+        ).values_list("materia_correlativa_id", flat=True)
+    )
+    if not req_ids:
+        return faltantes
+    reg_map: dict[int, Regularidad] = {}
+    regularidades = (
+        Regularidad.objects.filter(estudiante=estudiante, materia_id__in=req_ids)
+        .order_by("materia_id", "-fecha_cierre")
+        .all()
+    )
+    for reg in regularidades:
+        reg_map.setdefault(reg.materia_id, reg)
+    for mid in req_ids:
+        reg = reg_map.get(mid)
+        if not reg or reg.situacion not in (
+            Regularidad.Situacion.APROBADO,
+            Regularidad.Situacion.PROMOCIONADO,
+        ):
+            faltantes.append(mid)
+    return faltantes
+
+
+def _crear_acta_equivalencia(
+    *,
+    estudiante: Estudiante,
+    materia: Materia,
+    plan: PlanDeEstudio,
+    profesorado: Profesorado,
+    fecha: date,
+    numero_disposicion: str,
+    nota: str,
+    usuario: User | None,
+) -> ActaExamen:
+    anio = fecha.year
+    codigo = f"EQUIV-{materia.id}-{estudiante.dni}-{numero_disposicion}"
+    ultimo_numero = (
+        ActaExamen.objects.filter(profesorado=profesorado, anio_academico=anio)
+        .order_by("-numero")
+        .values_list("numero", flat=True)
+        .first()
+        or 0
+    )
+    numero = ultimo_numero + 1
+    acta, created = ActaExamen.objects.get_or_create(
+        codigo=codigo,
+        defaults={
+            "numero": numero,
+            "anio_academico": anio,
+            "tipo": ActaExamen.Tipo.REGULAR,
+            "profesorado": profesorado,
+            "materia": materia,
+            "plan": plan,
+            "anio_cursada": materia.anio_cursada,
+            "fecha": fecha,
+            "folio": numero_disposicion,
+            "libro": "",
+            "observaciones": "Equivalencia otorgada.",
+            "total_alumnos": 1,
+            "total_aprobados": 1,
+            "total_desaprobados": 0,
+            "total_ausentes": 0,
+            "created_by": usuario if usuario and usuario.is_authenticated else None,
+            "updated_by": usuario if usuario and usuario.is_authenticated else None,
+        },
+    )
+    if not created:
+        acta.estudiantes.all().delete()
+    ActaExamenEstudiante.objects.create(
+        acta=acta,
+        numero_orden=1,
+        permiso_examen="EQUIV",
+        dni=estudiante.dni,
+        apellido_nombre=estudiante.user.get_full_name(),
+        calificacion_definitiva=str(nota),
+    )
+    return acta
+
+
+@transaction.atomic
+def registrar_disposicion_equivalencia(
+    *,
+    estudiante: Estudiante,
+    profesorado: Profesorado,
+    plan: PlanDeEstudio,
+    numero_disposicion: str,
+    fecha_disposicion,
+    observaciones: str,
+    detalles_payload: list[dict],
+    origen: str,
+    usuario: User | None,
+    validar_correlatividades: bool,
+) -> EquivalenciaDisposicionResult:
+    dispo = EquivalenciaDisposicion.objects.create(
+        origen=origen,
+        estudiante=estudiante,
+        profesorado=profesorado,
+        plan=plan,
+        numero_disposicion=numero_disposicion,
+        fecha_disposicion=fecha_disposicion,
+        observaciones=observaciones or "",
+        creado_por=usuario if usuario and usuario.is_authenticated else None,
+    )
+
+    detalles: list[EquivalenciaDisposicionDetalle] = []
+
+    for payload in detalles_payload:
+        materia = Materia.objects.filter(id=payload["materia_id"], plan_de_estudio=plan).first()
+        if not materia:
+            raise ValueError("La materia seleccionada no pertenece al plan indicado.")
+
+        if estudiante_tiene_materia_aprobada(estudiante, materia):
+            raise ValueError(f"La materia {materia.nombre} ya figura como aprobada.")
+        nota = (payload.get("nota") or "").strip()
+        if not nota:
+            raise ValueError(f"Debe indicar la nota para {materia.nombre}.")
+        # Calcular si corresponde resguardo por correlativas faltantes
+        from apps.estudiantes.api.helpers import _calcular_resguardo_equivalencia
+
+        en_resguardo = _calcular_resguardo_equivalencia(estudiante, materia)
+
+        if validar_correlatividades and en_resguardo:
+            faltantes = _verificar_correlatividades_final(estudiante, materia)
+            nombres = (
+                list(Materia.objects.filter(id__in=faltantes).values_list("nombre", flat=True)) if faltantes else []
+            )
+            # No bloqueamos la creación — se registra en resguardo con advertencia
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Equivalencia en resguardo para %s - %s: correlativas faltantes: %s",
+                estudiante,
+                materia.nombre,
+                nombres,
+            )
+
+        detalle = EquivalenciaDisposicionDetalle.objects.create(
+            disposicion=dispo,
+            materia=materia,
+            nota=nota,
+            en_resguardo=en_resguardo,
+        )
+        detalles.append(detalle)
+        _crear_acta_equivalencia(
+            estudiante=estudiante,
+            materia=materia,
+            plan=plan,
+            profesorado=profesorado,
+            fecha=fecha_disposicion,
+            numero_disposicion=numero_disposicion,
+            nota=nota,
+            usuario=usuario,
+        )
+        # Verify consistency
+        verify_equivalencia_consistency(detalle)
+
+    return EquivalenciaDisposicionResult(disposicion=dispo, detalles=detalles)
+
+
+@transaction.atomic
+def actualizar_disposicion_equivalencia(
+    *,
+    disposicion_id: int,
+    numero_disposicion: str,
+    fecha_disposicion: date,
+    observaciones: str,
+    detalles_payload: list[dict],
+    usuario: User | None,
+    validar_correlatividades: bool = True,
+) -> EquivalenciaDisposicionResult:
+    dispo = (
+        EquivalenciaDisposicion.objects.select_related("estudiante__user", "profesorado", "plan")
+        .filter(id=disposicion_id)
+        .first()
+    )
+    if not dispo:
+        raise ValueError("No se encontró la disposición de equivalencia a modificar.")
+
+    estudiante = dispo.estudiante
+    profesorado = dispo.profesorado
+    plan = dispo.plan
+
+    antiguo_numero = dispo.numero_disposicion
+    numero_disposicion_limpio = numero_disposicion.strip()
+
+    dispo.numero_disposicion = numero_disposicion_limpio
+    dispo.fecha_disposicion = fecha_disposicion
+    dispo.observaciones = observaciones or ""
+    dispo.save()
+
+    from apps.estudiantes.api.helpers import _calcular_resguardo_equivalencia
+
+    # Materias actuales
+    detalles_existentes = {d.materia_id: d for d in dispo.detalles.all()}
+    nuevos_materia_ids = set()
+    detalles_actualizados: list[EquivalenciaDisposicionDetalle] = []
+
+    for item in detalles_payload:
+        materia_id = item["materia_id"]
+        nuevos_materia_ids.add(materia_id)
+        nota = (item.get("nota") or "").strip()
+        if not nota:
+            raise ValueError("Debe indicar la nota para todas las materias.")
+
+        materia = Materia.objects.filter(id=materia_id, plan_de_estudio=plan).first()
+        if not materia:
+            raise ValueError(f"La materia ID {materia_id} no pertenece al plan indicado.")
+
+        en_resguardo = _calcular_resguardo_equivalencia(estudiante, materia)
+
+        if materia_id in detalles_existentes:
+            detalle = detalles_existentes[materia_id]
+            detalle.nota = nota
+            detalle.en_resguardo = en_resguardo
+            detalle.save()
+        else:
+            if estudiante_tiene_materia_aprobada(estudiante, materia):
+                raise ValueError(f"La materia {materia.nombre} ya figura como aprobada en otra instancia.")
+            detalle = EquivalenciaDisposicionDetalle.objects.create(
+                disposicion=dispo,
+                materia=materia,
+                nota=nota,
+                en_resguardo=en_resguardo,
+            )
+        detalles_actualizados.append(detalle)
+
+        # Si cambió el número de disposición, limpiamos el acta vieja con el código anterior
+        if antiguo_numero != numero_disposicion_limpio:
+            codigo_viejo = f"EQUIV-{materia.id}-{estudiante.dni}-{antiguo_numero}"
+            ActaExamen.objects.filter(codigo=codigo_viejo).delete()
+
+        _crear_acta_equivalencia(
+            estudiante=estudiante,
+            materia=materia,
+            plan=plan,
+            profesorado=profesorado,
+            fecha=fecha_disposicion,
+            numero_disposicion=numero_disposicion_limpio,
+            nota=nota,
+            usuario=usuario,
+        )
+        verify_equivalencia_consistency(detalle)
+
+    # Eliminar materias que fueron quitadas en la edición
+    for materia_id, detalle in detalles_existentes.items():
+        if materia_id not in nuevos_materia_ids:
+            codigo_acta_vieja = f"EQUIV-{materia_id}-{estudiante.dni}-{antiguo_numero}"
+            ActaExamen.objects.filter(codigo=codigo_acta_vieja).delete()
+            codigo_acta_nueva = f"EQUIV-{materia_id}-{estudiante.dni}-{numero_disposicion_limpio}"
+            ActaExamen.objects.filter(codigo=codigo_acta_nueva).delete()
+            detalle.delete()
+
+    return EquivalenciaDisposicionResult(disposicion=dispo, detalles=detalles_actualizados)
+
+
+@transaction.atomic
+def eliminar_disposicion_equivalencia(*, disposicion_id: int) -> None:
+    dispo = EquivalenciaDisposicion.objects.select_related("estudiante").filter(id=disposicion_id).first()
+    if not dispo:
+        raise ValueError("No se encontró la disposición de equivalencia.")
+
+    estudiante = dispo.estudiante
+    numero_disposicion = dispo.numero_disposicion
+
+    for detalle in dispo.detalles.all():
+        codigo = f"EQUIV-{detalle.materia_id}-{estudiante.dni}-{numero_disposicion}"
+        ActaExamen.objects.filter(codigo=codigo).delete()
+
+    dispo.delete()
+
+
+def resolver_contexto_equivalencia(
+    *,
+    dni: str,
+    profesorado_id: int,
+    plan_id: int,
+) -> tuple[Estudiante, Profesorado, PlanDeEstudio]:
+    estudiante = Estudiante.objects.select_related("user").filter(persona__dni=dni).first()
+    if not estudiante:
+        raise ValueError("No se encontró el estudiante indicado.")
+    profesorado = Profesorado.objects.filter(id=profesorado_id).first()
+    if not profesorado:
+        raise ValueError("No se encontró el profesorado seleccionado.")
+    if not estudiante.carreras.filter(id=profesorado.id).exists():
+        raise ValueError("El estudiante no está inscripto en el profesorado seleccionado.")
+    plan = PlanDeEstudio.objects.select_related("profesorado").filter(id=plan_id, profesorado=profesorado).first()
+    if not plan:
+        raise ValueError("El plan de estudio no pertenece al profesorado indicado.")
+    return estudiante, profesorado, plan
+
+
+from apps.common.date_utils import format_date, format_datetime
+
+
+def serialize_disposicion(dispo: EquivalenciaDisposicion, detalles=None) -> dict:
+    detalles = detalles or list(dispo.detalles.select_related("materia"))
+    return {
+        "id": dispo.id,
+        "origen": dispo.origen,
+        "estudiante_dni": dispo.estudiante.dni,
+        "estudiante_nombre": dispo.estudiante.user.get_full_name() if dispo.estudiante.user_id else "",
+        "numero_disposicion": dispo.numero_disposicion,
+        "fecha_disposicion": format_date(dispo.fecha_disposicion),
+        "profesorado_id": dispo.profesorado_id,
+        "profesorado_nombre": dispo.profesorado.nombre,
+        "plan_id": dispo.plan_id,
+        "plan_resolucion": dispo.plan.resolucion,
+        "observaciones": dispo.observaciones,
+        "creado_por": dispo.creado_por.get_full_name() if dispo.creado_por else None,
+        "creado_en": format_datetime(dispo.creado_en),
+        "detalles": [
+            {
+                "id": detalle.id,
+                "materia_id": detalle.materia_id,
+                "materia_nombre": detalle.materia.nombre,
+                "nota": detalle.nota,
+            }
+            for detalle in detalles
+        ],
+    }
