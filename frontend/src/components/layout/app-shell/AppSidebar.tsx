@@ -546,10 +546,12 @@ export const AppSidebar: React.FC<AppSidebarProps> = ({
 						</Typography>
 						<Typography
 							component="a"
-							href="mailto:lucasoviedodev@gmail.com"
+							href="https://lucasoviedodev.org"
+							target="_blank"
+							rel="noopener"
 							sx={{ color: "#fff", fontSize: 13, fontWeight: 600, textDecoration: "underline", display: "block", mt: 0.5 }}
 						>
-							lucasoviedodev@gmail.com
+							lucasoviedodev.org
 						</Typography>
 						<Typography sx={{ color: "rgba(255,255,255,0.75)", fontSize: 12, mt: 0.25, mb: 2 }}>
 							Río Grande, Tierra del Fuego

@@ -88,7 +88,7 @@ https://demo.lucasoviedodev.org (fictitious data, one-click demo profiles).
 
 **Lucas Oviedo** — Desarrollador full stack (Python/Django + React)
 Río Grande, Tierra del Fuego, Argentina
-📧 lucasoviedodev@gmail.com
+🌐 https://lucasoviedodev.org
 
 ¿Necesitás un sistema de gestión a medida para tu institución u organización?
-Escribime.
+Contactame desde mi sitio.
