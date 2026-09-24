@@ -286,7 +286,7 @@ export default function LoginPage() {
 										background: "rgba(79, 70, 229,0.18)",
 									}}
 								>
-									<Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 0.5 }}>
+									<Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 0.5, color: "#fff" }}>
 										Demo con datos 100% ficticios
 									</Typography>
 									<Typography
