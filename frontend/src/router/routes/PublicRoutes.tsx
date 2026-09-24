@@ -32,7 +32,7 @@ export const buildPublicRoutes = ({
 	preinscripcionElement,
 }: PublicRoutesProps) => (
 	<>
-		<Route index element={<Navigate to="/preinscripcion" replace />} />
+		<Route index element={<Navigate to="/login" replace />} />
 		<Route path="/preinscripcion" element={preinscripcionElement} />
 		<Route path="/debug/inscripcion-preview" element={<InscripcionPreview />} />
 		<Route
